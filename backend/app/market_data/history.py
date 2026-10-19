@@ -125,11 +125,19 @@ class HistoryService:
         if tf_value is None:
             raise ValueError(f"Temporalidad {timeframe} no disponible en MT5")
         rates = self.mt5.copy_rates_from_pos(symbol, tf_value, 1, count)
+        error = self.mt5.last_error()
         if rates is None:
-            raise RuntimeError(f"MT5 devolvió None al solicitar velas cerradas de {symbol} {timeframe}: {self.mt5.last_error()}")
+            raise RuntimeError(f"MT5 devolvió None al solicitar velas cerradas de {symbol} {timeframe}; solicitadas: {count}; mt5.last_error(): {error}")
+        if len(rates) == 0:
+            raise FileNotFoundError(f"MT5 devolvió 0 velas cerradas para {symbol} {timeframe}; solicitadas: {count}; mt5.last_error(): {error}. Revise el historial del terminal y el límite de barras.")
+        columns = set(pd.DataFrame(rates).columns)
+        required = {"time", "open", "high", "low", "close", "tick_volume"}
+        missing = sorted(required - columns)
+        if missing:
+            raise ValueError(f"MT5 devolvió {len(rates)} barras para {symbol} {timeframe}, pero faltan campos obligatorios: {', '.join(missing)}")
         frame = rates_to_frame(rates)
         if frame.empty:
-            raise FileNotFoundError(f"MT5 no devolvió velas cerradas para {symbol} {timeframe}; compruebe el historial del terminal")
+            raise FileNotFoundError(f"MT5 devolvió {len(rates)} barras para {symbol} {timeframe}, pero ninguna tiene timestamp y OHLC válidos; mt5.last_error(): {self.mt5.last_error()}")
         return validate_candles(frame)[CSV_COLUMNS].reset_index(drop=True)
 
     def download(self, symbol: str, timeframe: str, start=None, end=None, progress=None) -> HistoryResult:
@@ -243,7 +251,7 @@ class HistoryService:
             raise RuntimeError(f"MT5 falló descargando {symbol} {timeframe} desde la posición 1, cantidad {count}: {error}")
         downloaded = rates_to_frame(rates)
         if downloaded.empty:
-            raise ValueError(f"MT5 no devolvió velas cerradas para {symbol} {timeframe} (solicitadas: {count}); compruebe el historial del terminal y el límite de barras")
+            raise FileNotFoundError(f"MT5 no devolvió velas cerradas para {symbol} {timeframe} (solicitadas: {count}); mt5.last_error(): {error}; compruebe el historial del terminal y el límite de barras")
         downloaded = validate_candles(downloaded)[CSV_COLUMNS]
         self.data_dir.mkdir(parents=True, exist_ok=True)
         archive_dir = self.data_dir / "mt5" / symbol

@@ -171,7 +171,9 @@ def market_candles(symbol: str, timeframe: str, count: int = Query(500, ge=1, le
     timeframe=timeframe.upper()
     if timeframe not in TIMEFRAMES: raise HTTPException(400,f"Temporalidad no admitida: {timeframe}")
     if not mt5_state.get("connected") or mt5._mt5 is None:
-        raise HTTPException(503,"MT5 desconectado; no se pueden consultar velas en vivo")
+        reason="MT5 desconectado; no se pueden consultar velas en vivo"
+        store.log("market_data_candles_error",{"symbol":symbol,"timeframe":timeframe,"requested_count":count,"received_count":0,"error":reason,"mt5_last_error":mt5.last_error()})
+        raise HTTPException(503,reason)
     try:
         terminal=mt5.terminal_info()
         if terminal is None: raise RuntimeError(f"MT5 terminal_info() no disponible: {mt5.last_error()}")
@@ -180,11 +182,22 @@ def market_candles(symbol: str, timeframe: str, count: int = Query(500, ge=1, le
         if account is None: raise RuntimeError(f"MT5 account_info() no disponible: {mt5.last_error()}")
         frame=HistoryService(mt5).fetch_recent_closed(symbol,timeframe,count)
         candles=candles_to_json(frame)
-    except LookupError as exc: raise HTTPException(404,str(exc))
-    except FileNotFoundError as exc: raise HTTPException(404,str(exc))
-    except ValueError as exc: raise HTTPException(422,str(exc))
-    except RuntimeError as exc: raise HTTPException(503,str(exc))
-    except Exception as exc: raise HTTPException(500,f"No se pudieron serializar las velas MT5: {exc}")
+    except LookupError as exc:
+        store.log("market_data_candles_error",{"symbol":symbol,"timeframe":timeframe,"requested_count":count,"received_count":0,"error":str(exc),"mt5_last_error":mt5.last_error()})
+        raise HTTPException(404,str(exc))
+    except FileNotFoundError as exc:
+        store.log("market_data_candles_error",{"symbol":symbol,"timeframe":timeframe,"requested_count":count,"received_count":0,"error":str(exc),"mt5_last_error":mt5.last_error()})
+        raise HTTPException(404,str(exc))
+    except ValueError as exc:
+        store.log("market_data_candles_error",{"symbol":symbol,"timeframe":timeframe,"requested_count":count,"received_count":0,"error":str(exc),"mt5_last_error":mt5.last_error()})
+        raise HTTPException(422,str(exc))
+    except RuntimeError as exc:
+        store.log("market_data_candles_error",{"symbol":symbol,"timeframe":timeframe,"requested_count":count,"received_count":0,"error":str(exc),"mt5_last_error":mt5.last_error()})
+        raise HTTPException(503,str(exc))
+    except Exception as exc:
+        reason=f"No se pudieron serializar las velas MT5: {exc}"
+        store.log("market_data_candles_error",{"symbol":symbol,"timeframe":timeframe,"requested_count":count,"received_count":0,"error":reason,"mt5_last_error":mt5.last_error()})
+        raise HTTPException(500,reason)
     return {"symbol":symbol,"timeframe":timeframe,"source":"MT5","closed_only":True,"count":len(candles),"last_candle_time":candles[-1]["time"] if candles else None,"candles":candles}
 
 @app.get("/api/positions")

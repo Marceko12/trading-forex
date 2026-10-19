@@ -21,6 +21,7 @@ class FakeMT5:
         self.rates = rates
         self.calls = []
         self.position_calls = []
+        self.error = (-1, "history unavailable")
 
     def symbols(self):
         return ["EURUSD", "EURUSDmicro", "xGOLDmicro", "GOLDmicro", "XAUUSDm", "EURPLN"]
@@ -40,7 +41,7 @@ class FakeMT5:
         return [{"time_msc": int(start.timestamp()*1000)+i*1000, "bid":1.1+i*.00001, "ask":1.1001+i*.00001, "last":0, "volume":1, "volume_real":0, "flags":1} for i in range(3)]
 
     def last_error(self):
-        return (0, "ok")
+        return self.error
 
     def symbol_info(self, symbol):
         if symbol == "GOLDmicro":
@@ -107,7 +108,7 @@ def test_download_recent_count_uses_closed_bar_position_and_exact_symbol_specs(t
 
 
 def test_download_count_reports_mt5_exact_empty_response(tmp_path):
-    with pytest.raises(ValueError, match="no devolvió velas cerradas.*GOLDmicro H1"):
+    with pytest.raises(FileNotFoundError, match="no devolvió velas cerradas.*GOLDmicro H1.*history unavailable"):
         HistoryService(FakeMT5([]), tmp_path).download_count("GOLDmicro", "H1", 100)
 
 
@@ -128,10 +129,23 @@ def test_recent_closed_bars_distinguish_none_empty_and_unknown_symbol(tmp_path):
     with pytest.raises(RuntimeError, match="devolvió None"):
         HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1")
     api.rates = []
-    with pytest.raises(FileNotFoundError, match="no devolvió velas cerradas"):
+    with pytest.raises(FileNotFoundError, match="devolvió 0 velas cerradas.*history unavailable"):
         HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1")
     with pytest.raises(LookupError, match="símbolo exacto"):
         HistoryService(api, tmp_path).fetch_recent_closed("GOLD", "H1")
+
+
+def test_recent_closed_bars_reject_missing_tick_volume_instead_of_inventing_it(tmp_path):
+    raw = {key: value for key, value in rates(1)[0].items() if key != "tick_volume"}
+    with pytest.raises(ValueError, match="faltan campos obligatorios: tick_volume"):
+        HistoryService(FakeMT5([raw]), tmp_path).fetch_recent_closed("GOLDmicro", "H1")
+
+
+def test_recent_closed_none_error_contains_mt5_last_error(tmp_path):
+    api = FakeMT5(None)
+    api.error = (-4401, "terminal history not synchronized")
+    with pytest.raises(RuntimeError, match="terminal history not synchronized"):
+        HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1", 500)
 
 
 def test_recent_closed_bars_reject_invalid_timeframe_and_invalid_timestamps(tmp_path):
