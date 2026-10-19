@@ -105,19 +105,19 @@ class PositionManager:
         if origin not in {"any", "manual", "automated"}: raise ValueError(f"Regla {index}: origen no admitido")
         normalized = {"id": str(rule.get("id") or f"rule-{index+1}"), "symbol": rule.get("symbol") or None,
                       "origin": origin, "action": action}
-        for field in ("max_loss", "min_profit", "stop_loss", "take_profit"):
+        for field in ("max_loss", "min_profit", "stop_loss", "take_profit", "trailing_stop"):
             value = rule.get(field)
             if value is not None:
                 try: value = float(value)
                 except (ValueError, TypeError) as exc: raise ValueError(f"Regla {index}: {field} debe ser numérico") from exc
-                if value <= 0 and field in {"stop_loss", "take_profit"}: raise ValueError(f"Regla {index}: {field} debe ser positivo")
+                if value <= 0 and field in {"stop_loss", "take_profit", "trailing_stop"}: raise ValueError(f"Regla {index}: {field} debe ser positivo")
                 normalized[field] = value
         if action == "close" and "max_loss" not in normalized and "min_profit" not in normalized:
             raise ValueError(f"Regla {index}: close exige max_loss o min_profit como condición")
-        if action == "modify" and not ({"stop_loss", "take_profit"} & normalized.keys()):
-            raise ValueError(f"Regla {index}: modify exige stop_loss o take_profit")
-        if action in {"close", "modify"} and "max_loss" not in normalized and "min_profit" not in normalized:
-            raise ValueError(f"Regla {index}: acción requiere max_loss o min_profit como condición")
+        if action == "modify" and not ({"stop_loss", "take_profit", "trailing_stop"} & normalized.keys()):
+            raise ValueError(f"Regla {index}: modify exige stop_loss, take_profit o trailing_stop")
+        if action == "close" and "max_loss" not in normalized and "min_profit" not in normalized:
+            raise ValueError(f"Regla {index}: close exige max_loss o min_profit como condición")
         if "max_loss" in normalized and normalized["max_loss"] >= 0:
             raise ValueError(f"Regla {index}: max_loss debe ser negativo")
         if "min_profit" in normalized and normalized["min_profit"] < 0:
@@ -211,7 +211,7 @@ class PositionManager:
                     attempted_at = self._acted.get(action_key, "never")
                     if attempted_at is None or (attempted_at != "never" and monotonic() - attempted_at < 15): continue
                     result = self._execute_rule(position, rule, real_ack)
-                    self._acted[action_key] = None if result["success"] else monotonic()
+                    self._acted[action_key] = (monotonic() if "trailing_stop" in rule else None) if result["success"] else monotonic()
                     attempted = True
                     self.log("position_management_action", result)
             return attempted
@@ -223,6 +223,9 @@ class PositionManager:
         current = next((p for p in (current_rows or []) if int(p.ticket) == ticket), None)
         if current is None or str(current.symbol) != symbol or int(getattr(current, "identifier", current.ticket)) != tracked["identifier"] or not tracked["time"] or int(getattr(current, "time", 0)) != int(datetime.fromisoformat(tracked["time"]).timestamp()):
             return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "Ticket, símbolo o tiempo de apertura ya no coincide"}
+        if (int(getattr(current, "type", -1)) != int(tracked["type"]) or
+                abs(_number(getattr(current, "volume", 0)) - _number(tracked["volume"])) > 1e-8):
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "Dirección o volumen de posición cambió desde la validación"}
         account, terminal = self.adapter.account_info(), self.adapter.terminal_info()
         if account is None or terminal is None or not getattr(account, "trade_allowed", False) or not getattr(terminal, "trade_allowed", False):
             return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "MT5 no autoriza trading en cuenta/terminal"}
@@ -251,8 +254,13 @@ class PositionManager:
         min_distance = point * max(stop_level, int(getattr(info, "trade_freeze_level", 0) or 0))
         request = {"symbol": symbol, "position": ticket}
         if rule["action"] == "modify":
-            sl, tp = _number(rule.get("stop_loss"), _number(current.sl)), _number(rule.get("take_profit"), _number(current.tp))
             bid, ask = _number(tick.bid), _number(tick.ask)
+            trailing = _number(rule.get("trailing_stop"))
+            sl = _number(rule.get("stop_loss"), _number(current.sl))
+            if trailing:
+                candidate = (bid - trailing) if buy else (ask + trailing)
+                if not sl or (candidate > sl if buy else candidate < sl): sl = candidate
+            tp = _number(rule.get("take_profit"), _number(current.tp))
             if buy:
                 if sl and (sl >= bid - min_distance or (current.sl and sl < current.sl)):
                     return {"ticket": ticket, "action": "modify", "success": False, "reason": "SL BUY fuera de límites o aumentaría riesgo"}
@@ -270,6 +278,8 @@ class PositionManager:
             if risk_cash > equity * self.risk_per_trade:
                 return {"ticket": ticket, "action": "modify", "success": False, "reason": f"Riesgo al nuevo SL ({risk_cash:.2f}) supera límite monetario ({equity*self.risk_per_trade:.2f})"}
             request.update({"action": self.adapter.constant("TRADE_ACTION_SLTP"), "sl": sl, "tp": tp})
+            if sl == _number(current.sl) and tp == _number(current.tp):
+                return {"ticket": ticket, "action": "modify", "success": True, "reason": "SL/TP ya están en esos niveles"}
         else:
             volume, vmin = _number(current.volume), _number(getattr(info, "volume_min", 0))
             vmax, vstep = _number(getattr(info, "volume_max", 0)), _number(getattr(info, "volume_step", 0))
@@ -285,6 +295,49 @@ class PositionManager:
                             "deviation": 20, "comment": "PositionManager rule"})
             if not request["price"] or not request["volume"]:
                 return {"ticket": ticket, "action": "close", "success": False, "reason": "Precio o volumen actual no válido"}
+        checker = getattr(self.adapter, "check_order", None)
+        if checker is None:
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "MT5 order_check no está disponible; acción bloqueada"}
+        checked = checker(request)
+        if checked is None or getattr(checked, "retcode", None) not in {0, self.adapter.constant("TRADE_RETCODE_DONE")}:
+            return {"ticket": ticket, "action": rule["action"], "success": False, "retcode": getattr(checked, "retcode", None), "reason": "MT5 order_check rechazó la acción"}
+        latest_rows = self.adapter.positions_get()
+        latest = next((p for p in (latest_rows or []) if int(p.ticket) == ticket), None)
+        latest_tick = self.adapter.symbol_info_tick(symbol)
+        latest_account, latest_terminal = self.adapter.account_info(), self.adapter.terminal_info()
+        if (latest is None or str(latest.symbol) != symbol or
+                int(getattr(latest, "identifier", latest.ticket)) != tracked["identifier"] or
+                int(getattr(latest, "time", 0)) != int(datetime.fromisoformat(tracked["time"]).timestamp()) or
+                int(getattr(latest, "type", -1)) != int(tracked["type"]) or
+                abs(_number(getattr(latest, "volume", 0)) - _number(tracked["volume"])) > 1e-8):
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "La posición cambió durante order_check; no se envió la acción"}
+        if latest_tick is None or time() - int(getattr(latest_tick, "time", 0)) > 30:
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "Cotización dejó de ser válida durante order_check"}
+        if (latest_account is None or latest_terminal is None or not getattr(latest_account, "trade_allowed", False) or
+                not getattr(latest_terminal, "trade_allowed", False)):
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "MT5 dejó de autorizar trading durante order_check"}
+        latest_mode = getattr(latest_account, "trade_mode", None)
+        if latest_mode == real_mode and (not real_ack or not self.allow_real_actions):
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "La cuenta cambió a REAL sin habilitación de gestión"}
+        if latest_mode not in {real_mode, demo_mode}:
+            return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "Tipo de cuenta cambió durante order_check"}
+        latest_bid, latest_ask = _number(latest_tick.bid), _number(latest_tick.ask)
+        if rule["action"] == "modify":
+            latest_sl, latest_tp = request["sl"], request["tp"]
+            if ((buy and latest_sl and (latest_sl < _number(latest.sl) or latest_sl >= latest_bid - min_distance)) or
+                    (not buy and latest_sl and (latest_sl > _number(latest.sl) or latest_sl <= latest_ask + min_distance))):
+                return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "SL cambió de validez o ampliaría riesgo durante order_check"}
+            if ((buy and latest_tp and latest_tp <= latest_bid + min_distance) or
+                    (not buy and latest_tp and latest_tp >= latest_ask - min_distance)):
+                return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "TP dejó de cumplir la distancia mínima durante order_check"}
+            latest_risk = abs(_number(latest.price_open) - latest_sl) / tick_size * tick_value * _number(latest.volume)
+            if latest_risk > _number(latest_account.equity) * self.risk_per_trade:
+                return {"ticket": ticket, "action": rule["action"], "success": False, "reason": "El riesgo excede el límite antes de enviar la modificación"}
+        else:
+            request["price"] = _number(latest_tick.bid if buy else latest_tick.ask)
+            checked_again = checker(request)
+            if checked_again is None or getattr(checked_again, "retcode", None) not in {0, self.adapter.constant("TRADE_RETCODE_DONE")}:
+                return {"ticket": ticket, "action": rule["action"], "success": False, "retcode": getattr(checked_again, "retcode", None), "reason": "MT5 order_check rechazó el cierre al precio actualizado"}
         response = self.adapter.send_order(request)
         retcode = getattr(response, "retcode", None)
         done = self.adapter.constant("TRADE_RETCODE_DONE")

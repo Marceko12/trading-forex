@@ -14,10 +14,15 @@ class MT5Adapter:
                 return {"connected": False, "error": error}
             account = mt5.account_info()
             terminal = mt5.terminal_info()
+            mode = "UNKNOWN"
+            if account is not None:
+                if getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", object()): mode = "DEMO"
+                elif getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", object()): mode = "REAL"
+                elif getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", object()): mode = "CONTEST"
             return {"connected": True, "account": account.login if account else None,
                     "server": account.server if account else None,
                     "balance": account.balance if account else None,
-                    "equity": account.equity if account else None,
+                    "equity": account.equity if account else None, "account_mode": mode,
                     "terminal": terminal.name if terminal else None}
         except Exception as exc:
             if self._mt5:
@@ -61,6 +66,9 @@ class MT5Adapter:
     def send_order(self, request):
         if not self._mt5: raise RuntimeError("MT5 desconectado")
         return self._mt5.order_send(request)
+    def check_order(self, request):
+        if not self._mt5: raise RuntimeError("MT5 desconectado")
+        return self._mt5.order_check(request)
     def constant(self, name):
         return getattr(self._mt5,name,None) if self._mt5 else None
     def timeframe_value(self, name):

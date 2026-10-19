@@ -18,6 +18,14 @@ class Store:
         with self._db() as db:
             rows = db.execute("SELECT id,kind,created_at,payload FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [{"id":i,"kind":k,"created_at":t,"payload":json.loads(p)} for i,k,t,p in rows]
+    def latest_event(self, kind):
+        with self._db() as db:
+            row = db.execute("SELECT id,kind,created_at,payload FROM events WHERE kind=? ORDER BY id DESC LIMIT 1", (kind,)).fetchone()
+        return None if row is None else {"id":row[0],"kind":row[1],"created_at":row[2],"payload":json.loads(row[3])}
+    def recent_auto_signal_keys(self, limit=5000):
+        with self._db() as db:
+            rows = db.execute("SELECT payload FROM events WHERE kind IN ('auto_order_proposed','auto_order_result','signal_held') ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [json.loads(row[0]) for row in rows]
     def save_backtest(self, symbol, result):
         with self._db() as db:
             cur = db.execute("INSERT INTO backtests(created_at,symbol,result) VALUES(?,?,?)", (datetime.now(timezone.utc).isoformat(),symbol,json.dumps(result, default=str)))

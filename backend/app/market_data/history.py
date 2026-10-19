@@ -156,8 +156,18 @@ class HistoryService:
         active_tmp = active_csv.with_name(f".{active_csv.name}.{nonce}.tmp")
         merged.to_csv(archive_tmp, index=False)
         merged.to_csv(active_tmp, index=False)
-        archive_tmp.replace(archive_csv)
-        active_tmp.replace(active_csv)
+        archive_unchanged = active_unchanged = False
+        try:
+            if archive_csv.exists():
+                archive_unchanged = validate_candles(pd.read_csv(archive_csv))[CSV_COLUMNS].equals(merged.reset_index(drop=True))
+            if active_csv.exists():
+                active_unchanged = validate_candles(pd.read_csv(active_csv))[CSV_COLUMNS].equals(merged.reset_index(drop=True))
+        except Exception:
+            archive_unchanged = active_unchanged = False
+        if archive_unchanged: archive_tmp.unlink()
+        else: archive_tmp.replace(archive_csv)
+        if active_unchanged: active_tmp.unlink()
+        else: active_tmp.replace(active_csv)
         info = self.mt5.symbol_info(symbol)
         spec = {}
         if info:

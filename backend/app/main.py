@@ -5,7 +5,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
-from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, HistoryCountDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest, PositionManagerConfigRequest
+from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, HistoryCountDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest, PositionManagerConfigRequest, AutoTradingStartRequest
 from .core.runner import AnalysisRunner
 from .database.store import Store
 from .mt5.adapter import MT5Adapter
@@ -16,8 +16,9 @@ from .market_data.history import HistoryService, TIMEFRAMES, discover_symbols, r
 from .market_data.validation import validate_candles
 from .strategies.signal_engine import evaluate_signal
 from .positions.manager import PositionManager
+from .core.auto_trader import AutoTradingEngine
 
-app = FastAPI(title=settings.app_name, version="0.1.0", description="Motor inicial seguro: análisis y backtest; no envía órdenes.")
+app = FastAPI(title=settings.app_name, version="0.1.0", description="PAPER por defecto; operaciones solo con habilitación DEMO explícita. REAL bloqueado para el motor automático.")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173","http://127.0.0.1:5173","http://localhost:5174","http://127.0.0.1:5174"], allow_methods=["*"], allow_headers=["*"])
 store=Store(settings.database_path)
 mt5=MT5Adapter()
@@ -28,6 +29,7 @@ signal_cache={}
 signal_bars=set()
 
 def _scan_market(symbols, timeframe):
+    results=[]
     for symbol in symbols:
         if mt5_state.get("connected") and mt5._mt5 is not None:
             rates=mt5.copy_rates_from_pos(symbol,timeframe,1,500)
@@ -42,11 +44,16 @@ def _scan_market(symbols, timeframe):
             signal=evaluate_signal(symbol,timeframe,frame,source="CSV local")
         key=(symbol,timeframe,signal["bar_time"])
         signal_cache[symbol]=signal
+        results.append(signal)
         if key not in signal_bars:
             signal_bars.add(key); store.log("signal",signal)
+    return results
 
 runner=AnalysisRunner(_scan_market)
 position_manager=PositionManager(mt5,lambda: bool(mt5_state.get("connected") and mt5._mt5 is not None),store.log,settings.risk_per_trade,allow_real_actions=settings.position_manager_allow_real)
+auto_trader=AutoTradingEngine(mt5,lambda: bool(mt5_state.get("connected") and mt5._mt5 is not None),_scan_market,store.log,
+    risk_state_loader=lambda: (store.latest_event("auto_risk_baseline") or {}).get("payload"),
+    seen_loader=store.recent_auto_signal_keys)
 
 @app.on_event("startup")
 def start_position_supervisor():
@@ -81,7 +88,8 @@ def _read_or_download_history(request):
 @app.get("/api/status")
 def status():
     engine=runner.status()
-    return {"mode":runtime["mode"],"engine_running":engine["running"],"paused":engine["paused"],"engine":engine,"mt5":mt5_state,"position_manager":position_manager.status(),"symbols":list(settings.symbols),"risk":{"per_trade":settings.risk_per_trade,"daily_loss_limit":settings.daily_loss_limit,"max_drawdown":settings.max_drawdown},"execution_enabled":False}
+    actual_mode=mt5_state.get("account_mode","UNKNOWN")
+    return {"mode":runtime["mode"],"account_mode":actual_mode,"engine_running":engine["running"],"paused":engine["paused"],"engine":engine,"auto_trading":auto_trader.status(),"mt5":mt5_state,"position_manager":position_manager.status(),"symbols":list(settings.symbols),"risk":{"per_trade":settings.risk_per_trade,"daily_loss_limit":settings.daily_loss_limit,"max_drawdown":settings.max_drawdown},"execution_enabled":auto_trader.status()["enabled"]}
 
 @app.post("/api/mt5/connect")
 def connect_mt5():
@@ -94,6 +102,7 @@ def connect_mt5():
 def disconnect_mt5():
     global mt5_state
     position_manager.disarm()
+    auto_trader.stop()
     runner.stop()
     mt5.disconnect(); mt5_state={"connected":False,"error":"Desconectado por el usuario"}
     return mt5_state
@@ -320,6 +329,25 @@ def stop():
     return {"ok":True,"engine":state}
 @app.post("/api/engine/emergency-stop")
 def emergency_stop():
+    auto_trader.stop()
     state=runner.stop()
     store.log("emergency_stop",{"at":datetime.now(timezone.utc).isoformat()})
     return {"ok":True,"engine":state,"note":"Se detuvo el análisis local. No se liquidaron posiciones MT5."}
+
+@app.post("/api/trading-engine/start")
+def start_trading_engine(request: AutoTradingStartRequest):
+    timeframe=request.timeframe.upper()
+    if timeframe not in TIMEFRAMES: raise HTTPException(400,f"Temporalidad no admitida: {timeframe}")
+    if not SYMBOL_RE.fullmatch(request.symbol): raise HTTPException(400,"Símbolo MT5 inválido")
+    try:
+        state=auto_trader.start(mode=request.mode,symbol=request.symbol,timeframe=timeframe,
+            limits={"risk_per_trade":request.risk_per_trade,"daily_loss_limit":request.daily_loss_limit,
+                    "max_drawdown":request.max_drawdown,"max_positions":request.max_positions,
+                    "max_spread_points":request.max_spread_points},confirm_demo=request.confirm_demo)
+    except ValueError as exc: raise HTTPException(400,str(exc))
+    return {"ok":True,"trading_engine":state}
+
+@app.post("/api/trading-engine/stop")
+def stop_trading_engine():
+    state=auto_trader.stop()
+    return {"ok":True,"trading_engine":state,"note":"Se detuvieron nuevas entradas. No se cerró ninguna posición existente."}

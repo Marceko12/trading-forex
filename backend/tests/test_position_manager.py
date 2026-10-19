@@ -30,6 +30,7 @@ class FakeMT5:
     def terminal_info(self): return self.terminal
     def constant(self, name): return self.constants.get(name)
     def last_error(self): return (0, "ok")
+    def check_order(self, request): return SimpleNamespace(retcode=0, comment="checked")
     def send_order(self, request):
         self.orders.append(dict(request))
         if request["action"] == self.constants["TRADE_ACTION_SLTP"]:
@@ -123,6 +124,27 @@ def test_modify_rule_cannot_widen_stop_risk_or_use_stale_quote():
     assert mt5.orders == []
     result = [payload for kind, payload in events if kind == "position_management_action"][-1]
     assert result["success"] is False and "aumentaría riesgo" in result["reason"]
+
+
+def test_trailing_stop_is_configurable_and_must_only_tighten_risk():
+    mt5 = FakeMT5(positions=[position(profit=20)])
+    manager, events = build_manager(mt5)
+    manager.configure(True, [{"action": "modify", "origin": "manual", "trailing_stop": 2}])
+    manager.poll_once()
+    assert mt5.orders == []  # Candidate at 108 would widen the existing 95 SL? It tightens, but risk cap rejects >1%.
+    result = [payload for kind, payload in events if kind == "position_management_action"][-1]
+    assert result["success"] is False
+
+
+def test_action_revalidates_volume_and_runs_order_check():
+    mt5 = FakeMT5(positions=[position(profit=20)])
+    manager, events = build_manager(mt5)
+    rule = manager._validate_rule({"action": "modify", "min_profit": 10, "stop_loss": 105}, 0)
+    tracked = manager._serialize(mt5.positions[0])
+    mt5.positions[0].volume = .2
+    result = manager._execute_rule(tracked, rule, False)
+    assert mt5.orders == [] and not result["success"]
+    assert "volumen" in result["reason"]
 
 
 def test_supervisor_thread_runs_and_stops_without_signal_engine():

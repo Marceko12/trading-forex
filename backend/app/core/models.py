@@ -58,3 +58,14 @@ class PositionManagerConfigRequest(BaseModel):
     rules: list[dict] = Field(default_factory=list)
     confirm_real: str = ""
 
+class AutoTradingStartRequest(BaseModel):
+    mode: str = "PAPER"
+    symbol: str = "GOLDmicro"
+    timeframe: str = "H1"
+    risk_per_trade: float = Field(default=0.005, gt=0, le=0.02)
+    daily_loss_limit: float = Field(default=0.02, gt=0, le=0.20)
+    max_drawdown: float = Field(default=0.05, gt=0, le=0.50)
+    max_positions: int = Field(default=1, ge=1, le=20)
+    max_spread_points: float = Field(default=50, gt=0)
+    confirm_demo: str = ""
+

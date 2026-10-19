@@ -3,7 +3,7 @@ import { ChangeEvent, useEffect, useRef, useState } from 'react'
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api'
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4']
 type SymbolMatch = { symbol: string; instrument: string; micro: boolean; variant: string }
-type Status = { mode: string; engine_running: boolean; paused: boolean; engine?: { last_scan?: string; scan_count: number; last_error?: string }; mt5: { connected: boolean; error?: string; balance?: number; equity?: number }; symbols: string[]; risk: { per_trade: number; daily_loss_limit: number; max_drawdown: number }; execution_enabled: boolean }
+type Status = { mode: string; account_mode?: string; engine_running: boolean; paused: boolean; engine?: { last_scan?: string; scan_count: number; last_error?: string }; auto_trading?: any; mt5: { connected: boolean; error?: string; balance?: number; equity?: number }; symbols: string[]; risk: { per_trade: number; daily_loss_limit: number; max_drawdown: number }; execution_enabled: boolean }
 type PositionManagerStatus = { running: boolean; connected: boolean; stale: boolean; enabled: boolean; real_acknowledged: boolean; real_actions_allowed_by_config: boolean; interval_seconds: number; last_poll?: string; last_error?: string; position_count: number; positions: any[]; alerts: any[]; rules: any[] }
 type HistoryInfo = { symbol: string; timeframe: string; count: number; first_time: string; last_time: string; validation: string; metadata?: { source?: string; downloaded_at?: string; requested_start?: string; requested_end?: string } }
 
@@ -15,6 +15,21 @@ export default function App() {
   const [managerEnabled, setManagerEnabled] = useState(false)
   const [managerRules, setManagerRules] = useState('[]')
   const [realManagementPhrase, setRealManagementPhrase] = useState('')
+  const [manualMaxLoss, setManualMaxLoss] = useState(50)
+  const [manualTarget, setManualTarget] = useState(50)
+  const [manualSymbol, setManualSymbol] = useState('')
+  const [manualStop, setManualStop] = useState('')
+  const [manualTake, setManualTake] = useState('')
+  const [manualTrail, setManualTrail] = useState('')
+  const [autoMode, setAutoMode] = useState('PAPER')
+  const [autoSymbol, setAutoSymbol] = useState('GOLDmicro')
+  const [autoTimeframe, setAutoTimeframe] = useState('H1')
+  const [autoRisk, setAutoRisk] = useState(0.005)
+  const [autoDailyLoss, setAutoDailyLoss] = useState(0.02)
+  const [autoDrawdown, setAutoDrawdown] = useState(0.05)
+  const [autoMaxPositions, setAutoMaxPositions] = useState(1)
+  const [autoMaxSpread, setAutoMaxSpread] = useState(50)
+  const [demoPhrase, setDemoPhrase] = useState('')
   const managerConfigLoaded = useRef(false)
   const [events, setEvents] = useState<any[]>([])
   const [error, setError] = useState('')
@@ -94,6 +109,26 @@ export default function App() {
     } catch (e) { setError(`No se pudo añadir la regla: ${String(e)}`) }
   }
 
+  function addManualPolicy() {
+    try {
+      const current = JSON.parse(managerRules)
+      if (!Array.isArray(current)) throw Error('Las reglas deben ser un arreglo.')
+      const symbol = manualSymbol.trim() || undefined
+      const added: any[] = []
+      if (manualMaxLoss > 0 || manualTarget > 0) added.push({ id: `manual-close-${current.length + 1}`, origin: 'manual', symbol, action: 'close', ...(manualMaxLoss > 0 ? { max_loss: -Math.abs(manualMaxLoss) } : {}), ...(manualTarget > 0 ? { min_profit: Math.abs(manualTarget) } : {}) })
+      if (manualStop.trim() || manualTake.trim() || manualTrail.trim()) {
+        const rule: any = { id: `manual-protect-${current.length + added.length + 1}`, origin: 'manual', symbol, action: 'modify' }
+        if (manualStop.trim()) rule.stop_loss = Number(manualStop)
+        if (manualTake.trim()) rule.take_profit = Number(manualTake)
+        if (manualTrail.trim()) rule.trailing_stop = Number(manualTrail)
+        if (!Number.isFinite(rule.stop_loss ?? 1) || !Number.isFinite(rule.take_profit ?? 1) || !Number.isFinite(rule.trailing_stop ?? 1)) throw Error('SL, TP y trailing deben ser numéricos.')
+        added.push(rule)
+      }
+      if (!added.length) throw Error('Configure al menos una condición o nivel de protección.')
+      setManagerRules(JSON.stringify([...current, ...added], null, 2))
+    } catch (e) { setError(`No se pudo añadir la política: ${String(e)}`) }
+  }
+
   async function post(path: string) {
     setBusy(true)
     try { const r = await fetch(API + path, { method: 'POST' }); const v = await r.json(); if (!r.ok) throw Error(v.detail || 'Error'); await load() }
@@ -107,6 +142,18 @@ export default function App() {
       const r = await fetch(`${API}/engine/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, timeframe }) })
       const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar el análisis')
       await load()
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  }
+
+  async function startAutoTrading() {
+    setBusy(true); setError('')
+    try {
+      const r = await fetch(`${API}/trading-engine/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: autoMode, symbol: autoSymbol, timeframe: autoTimeframe, risk_per_trade: autoRisk,
+          daily_loss_limit: autoDailyLoss, max_drawdown: autoDrawdown, max_positions: autoMaxPositions,
+          max_spread_points: autoMaxSpread, confirm_demo: demoPhrase }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar el motor automático')
+      setDemoPhrase(''); await load()
     } catch (e) { setError(String(e)) } finally { setBusy(false) }
   }
 
@@ -226,13 +273,32 @@ export default function App() {
   const activeBacktest = vectorbtResult || backtestRows[0] || null
 
   return <main>
-    <header><div><small>TRADING SYSTEM / CONTROL</small><h1>AI Trading Engine</h1></div><span className="badge">{status?.mode || '…'} · ORDENES DESACTIVADAS</span></header>
+    <header><div><small>TRADING SYSTEM / CONTROL</small><h1>AI Trading Engine</h1></div><span className="badge">Modo configurado {status?.mode || '…'} · Cuenta {status?.account_mode || 'UNKNOWN'} · Real bloqueado</span></header>
     {error && <p className="error">{error}</p>}
     <section className="cards">
       <article><small>MT5</small><h2 className={status?.mt5.connected ? 'green' : 'red'}>{status?.mt5.connected ? 'Conectado' : 'Desconectado'}</h2><p>{status?.mt5.error || 'Cuenta conectada'}</p><button onClick={() => post('/mt5/connect')} disabled={busy}>Conectar MT5</button> <button onClick={() => post('/mt5/disconnect')} disabled={busy}>Desconectar</button></article>
       <article><small>BALANCE / EQUITY</small><h2>{status?.mt5.connected ? `${status.mt5.balance} / ${status.mt5.equity}` : '—'}</h2><p>Solo datos recibidos del terminal</p></article>
       <article><small>RIESGO CONFIGURADO</small><h2>{status ? `${(status.risk.per_trade * 100).toFixed(2)}% / operación` : '—'}</h2><p>Pérdida diaria {status ? status.risk.daily_loss_limit * 100 : '—'}% · DD {status ? status.risk.max_drawdown * 100 : '—'}%</p></article>
       <article><small>MOTOR</small><h2>{status?.engine_running ? (status.paused ? 'Pausado' : 'Activo') : 'Detenido'}</h2><button onClick={startAnalysis} disabled={busy || !selected}>Iniciar análisis</button> <button onClick={toggleAnalysisPause} disabled={busy || !status?.engine_running}>{status?.paused ? 'Reanudar' : 'Pausar'}</button> <button onClick={() => post('/engine/stop')} disabled={busy || !status?.engine_running}>Detener</button><p>{status?.engine?.last_scan ? `Último análisis: ${new Date(status.engine.last_scan).toLocaleTimeString()} · ${status.engine.scan_count} ciclos` : 'Esperando análisis'}</p>{status?.engine?.last_error && <p className="error">{status.engine.last_error}</p>}</article>
+    </section>
+
+    <section className="panel auto-trading-panel">
+      <div className="sectionhead"><div><h2>Motor automático · GOLDmicro</h2><span>Control independiente del análisis y del Position Manager. PAPER por defecto; nunca habilita REAL.</span></div><b className={status?.auto_trading?.enabled ? 'green' : 'muted'}>{status?.auto_trading?.enabled ? `ACTIVO · ${status.auto_trading.mode}` : 'DETENIDO'}</b></div>
+      <div className="formgrid">
+        <label>Modo<select value={autoMode} onChange={e => setAutoMode(e.target.value)}><option value="PAPER">PAPER · sin órdenes al bróker</option><option value="DEMO">DEMO · solo cuenta demo verificada</option></select></label>
+        <label>Símbolo<input value={autoSymbol} onChange={e => setAutoSymbol(e.target.value)} list="broker-symbols" /></label>
+        <label>Temporalidad<select value={autoTimeframe} onChange={e => setAutoTimeframe(e.target.value)}>{['M1','M5','M15','H1','H4'].map(tf => <option key={tf}>{tf}</option>)}</select></label>
+        <label>Riesgo por operación (%)<input type="number" min="0.01" max="2" step="0.01" value={autoRisk * 100} onChange={e => setAutoRisk(Number(e.target.value) / 100)} /></label>
+        <label>Pérdida diaria máxima (%)<input type="number" min="0.1" max="20" step="0.1" value={autoDailyLoss * 100} onChange={e => setAutoDailyLoss(Number(e.target.value) / 100)} /></label>
+        <label>Drawdown máximo (%)<input type="number" min="0.1" max="50" step="0.1" value={autoDrawdown * 100} onChange={e => setAutoDrawdown(Number(e.target.value) / 100)} /></label>
+        <label>Máximo de posiciones<input type="number" min="1" max="20" value={autoMaxPositions} onChange={e => setAutoMaxPositions(Math.max(1, Number(e.target.value) || 1))} /></label>
+        <label>Spread máximo (points MT5)<input type="number" min="0.1" step="0.1" value={autoMaxSpread} onChange={e => setAutoMaxSpread(Number(e.target.value))} /></label>
+      </div>
+      {autoMode === 'DEMO' && <label>Confirmación requerida: escriba OPERAR EN DEMO<input value={demoPhrase} onChange={e => setDemoPhrase(e.target.value)} autoComplete="off" /></label>}
+      <div className="actions"><button onClick={startAutoTrading} disabled={busy || !status?.mt5.connected || status?.auto_trading?.enabled}>Iniciar motor automático</button><button onClick={() => post('/trading-engine/stop')} disabled={busy || !status?.auto_trading?.enabled}>Detener nuevas entradas</button><span>El análisis de señales puede seguir activo; detener aquí nunca cierra posiciones.</span></div>
+      <p className={status?.auto_trading?.blocked_reason?.includes('bloquead') || status?.auto_trading?.blocked_reason?.includes('rechaz') ? 'error' : 'muted'}>Estado / último motivo: {status?.auto_trading?.blocked_reason || 'Detenido'}{status?.auto_trading?.last_action ? ` · ${status?.auto_trading?.last_action}` : ''}</p>
+      {status?.auto_trading?.paper_positions?.length > 0 && <div className="historyresult"><b>Propuestas PAPER sin ejecución real</b>{status?.auto_trading?.paper_positions?.map((p: any, i: number) => <span key={`${p.bar_time}-${i}`}>{p.direction} {p.symbol} · volumen {p.volume} · entrada {p.entry} · SL {p.stop_loss} · TP {p.take_profit}</span>)}</div>}
+      <p className="muted">En DEMO cada entrada requiere datos MT5 recientes, spread y stops dentro de las reglas del bróker, sizing por tick_size/tick_value reales, límites de riesgo, margen disponible, order_check y confirmación posterior de positions_get. En REAL el envío está bloqueado en backend.</p>
     </section>
 
     <section className="panel history-panel">
@@ -280,10 +346,10 @@ export default function App() {
       {positionManager?.last_error && <p className="error">Error del supervisor: {positionManager.last_error}</p>}
       {positionManager?.alerts?.length ? <div className="error"><b>Protección incompleta</b>{positionManager.alerts.map((a: any) => <p key={a.ticket}>Ticket {a.ticket} · {a.symbol} ({a.origin}) · falta {a.missing_sl && a.missing_tp ? 'SL y TP' : a.missing_sl ? 'SL' : 'TP'}</p>)}</div> : <p className="muted">Sin alertas de SL/TP.</p>}
       {positions.length ? <div className="table position-table"><div className="row head"><span>Ticket / símbolo</span><span>Origen / Magic</span><span>Volumen</span><span>Precio apertura / actual</span><span>SL / TP</span><span>Beneficio / riesgo a SL</span></div>{positions.map((p: any) => <div className="row" key={p.ticket}><b>{p.ticket} · {p.symbol} · {p.type_name}</b><span>{p.origin} · {p.magic}</span><span>{p.volume}</span><span>{p.price_open} / {p.price_current}</span><span>{p.sl || 'SIN SL'} / {p.tp || 'SIN TP'}</span><span>{Number(p.profit).toFixed(2)} / {p.risk_to_sl == null ? 'N/D' : Number(p.risk_to_sl).toFixed(2)}</span></div>)}</div> : <p className="muted">{positionManager?.connected ? 'No hay posiciones abiertas.' : 'Posiciones no disponibles mientras MT5 esté desconectado.'}</p>}
-      <details><summary>Reglas de gestión (requieren habilitación independiente)</summary><p className="muted">JSON de reglas: action = maintain, close o modify; origin = any, manual o automated; condiciones max_loss (negativo) o min_profit (positivo). modify requiere stop_loss y/o take_profit como precio absoluto. Sin habilitación, solo se supervisa. Las acciones REAL también requieren POSITION_MANAGER_ALLOW_REAL=true; permanece false hasta validar la gestión en DEMO.</p><textarea aria-label="Reglas de gestión de posiciones" rows={7} value={managerRules} onChange={e => setManagerRules(e.target.value)} spellCheck={false} /><div className="actions"><button onClick={addPositionRule} disabled={busy}>Añadir regla mantener</button><label><input type="checkbox" checked={managerEnabled} onChange={e => setManagerEnabled(e.target.checked)} /> Habilitar acciones automáticas configuradas</label></div><label>Para habilitar acciones en cuenta REAL, escriba HABILITAR GESTION REAL<input value={realManagementPhrase} onChange={e => setRealManagementPhrase(e.target.value)} autoComplete="off" /></label><button onClick={savePositionManagerConfig} disabled={busy}>Guardar configuración del Position Manager</button></details>
+      <details><summary>Reglas de gestión (requieren habilitación independiente)</summary><p className="muted">Las políticas se aplican solo después de marcar “Habilitar” y guardar. La pérdida máxima y el objetivo crean una política de cierre; SL/TP/trailing crean otra política de protección manual. Un SL solo puede apretarse y cada acción valida de nuevo ticket, símbolo, volumen, dirección, precio, margen de stops y riesgo máximo.</p><div className="formgrid"><label>Símbolo (vacío = todos)<input list="broker-symbols" value={manualSymbol} onChange={e => setManualSymbol(e.target.value)} /></label><label>Pérdida máxima monetaria<input type="number" min="0" value={manualMaxLoss} onChange={e => setManualMaxLoss(Math.max(0, Number(e.target.value)))} /></label><label>Objetivo de beneficio monetario<input type="number" min="0" value={manualTarget} onChange={e => setManualTarget(Math.max(0, Number(e.target.value)))} /></label><label>Stop Loss absoluto opcional<input type="number" step="any" value={manualStop} onChange={e => setManualStop(e.target.value)} /></label><label>Take Profit absoluto opcional<input type="number" step="any" value={manualTake} onChange={e => setManualTake(e.target.value)} /></label><label>Distancia de trailing opcional (precio)<input type="number" min="0" step="any" value={manualTrail} onChange={e => setManualTrail(e.target.value)} /></label></div><div className="actions"><button onClick={addManualPolicy} disabled={busy}>Añadir políticas manuales</button><button onClick={addPositionRule} disabled={busy}>Añadir regla mantener</button><label><input type="checkbox" checked={managerEnabled} onChange={e => setManagerEnabled(e.target.checked)} /> Habilitar acciones automáticas configuradas</label></div><textarea aria-label="Reglas de gestión de posiciones" rows={7} value={managerRules} onChange={e => setManagerRules(e.target.value)} spellCheck={false} /><label>Para habilitar acciones en cuenta REAL, escriba HABILITAR GESTION REAL<input value={realManagementPhrase} onChange={e => setRealManagementPhrase(e.target.value)} autoComplete="off" /></label><button onClick={savePositionManagerConfig} disabled={busy}>Guardar configuración del Position Manager</button></details>
       <p className="muted">Clasificación: Magic 0 = manual; Magic distinto de 0 = automática (EA/bot), sin atribuirla a este motor. La gestión se desarma al desconectar o reiniciar el backend.</p>
     </section>
     <section className="panel event-panel"><details><summary>Eventos y registros ({events.length})</summary>{events.length ? events.slice(0, 20).map(x => <p className="event" key={x.id}><b>{x.kind}</b> · {x.created_at} · {JSON.stringify(x.payload)}</p>) : <p className="muted">Sin eventos guardados.</p>}</details></section>
-    <footer>Sin IA entrenada. Sin envío de órdenes. Los resultados históricos no garantizan resultados futuros.</footer>
+    <footer>Sin IA entrenada. PAPER no envía órdenes; DEMO solo con habilitación explícita. REAL está bloqueado. Los resultados históricos no garantizan resultados futuros.</footer>
   </main>
 }

@@ -4,7 +4,7 @@ import os
 @dataclass(frozen=True)
 class Settings:
     app_name: str = "AI Trading Engine"
-    mode: str = os.getenv("TRADING_MODE", "BACKTEST").upper()
+    mode: str = os.getenv("TRADING_MODE", "PAPER").upper()
     database_path: str = os.getenv("DATABASE_PATH", "data/trading.db")
     risk_per_trade: float = float(os.getenv("RISK_PER_TRADE", "0.005"))
     daily_loss_limit: float = float(os.getenv("DAILY_LOSS_LIMIT", "0.02"))
@@ -13,5 +13,5 @@ class Settings:
     symbols: tuple[str, ...] = tuple(s.strip() for s in os.getenv("SYMBOLS", "XAUUSD,EURUSD,GBPUSD,USDJPY").split(",") if s.strip())
 
 settings = Settings()
-if settings.mode not in {"BACKTEST", "PAPER", "DEMO"}:
-    settings = Settings(mode="BACKTEST")
+if settings.mode not in {"BACKTEST", "PAPER", "DEMO", "REAL"}:
+    settings = Settings(mode="PAPER")
