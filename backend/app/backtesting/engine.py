@@ -17,10 +17,11 @@ def run_backtest(frame, initial_balance=10_000, risk_fraction=.005, spread=0, co
             hit_sl = bar.low <= position["sl"] if position["side"] == 1 else bar.high >= position["sl"]
             hit_tp = bar.high >= position["tp"] if position["side"] == 1 else bar.low <= position["tp"]
             if hit_sl or hit_tp:
-                exit_price = position["sl"] if hit_sl else position["tp"]
-                pnl = (exit_price-position["entry"]) * position["side"] * position["qty"] - commission
-                equity += pnl
-                trades.append({**position,"exit":float(exit_price),"pnl":float(pnl),"duration_bars":i-position["index"],"exit_reason":"SL" if hit_sl else "TP"})
+                raw_exit = position["sl"] if hit_sl else position["tp"]
+                exit_price = raw_exit - position["side"]*(spread/2+slippage)
+                gross_pnl = (exit_price-position["entry"]) * position["side"] * position["qty"]
+                equity += gross_pnl - commission
+                trades.append({**position,"exit":float(exit_price),"pnl":float(gross_pnl - 2*commission),"duration_bars":i-position["index"],"exit_reason":"SL" if hit_sl else "TP"})
                 position=None
         if position is None and pd.notna(prior.atr) and pd.notna(prior.adx) and prior.adx >= 18:
             long = prior.ema_fast > prior.ema_slow and prior.macd > prior.macd_signal and 45 <= prior.rsi <= 70
@@ -36,10 +37,10 @@ def run_backtest(frame, initial_balance=10_000, risk_fraction=.005, spread=0, co
         peak=max(peak,equity); max_dd=max(max_dd,(peak-equity)/peak if peak else 0)
         curve.append({"time":bar.time.isoformat(),"equity":float(equity)})
     if position:
-        last=float(d.iloc[-1].close); pnl=(last-position["entry"])*position["side"]*position["qty"]-commission
-        equity+=pnl; trades.append({**position,"exit":last,"pnl":float(pnl),"duration_bars":len(d)-1-position["index"],"exit_reason":"END"})
+        last=float(d.iloc[-1].close)-position["side"]*(spread/2+slippage); gross_pnl=(last-position["entry"])*position["side"]*position["qty"]
+        equity+=gross_pnl-commission; trades.append({**position,"exit":last,"pnl":float(gross_pnl-2*commission),"duration_bars":len(d)-1-position["index"],"exit_reason":"END"})
     pnls=np.array([t["pnl"] for t in trades],dtype=float)
     wins=pnls[pnls>0]; losses=pnls[pnls<0]
     returns=np.diff(np.array([initial_balance]+[x["equity"] for x in curve]))
     sharpe=float(np.mean(returns)/np.std(returns,ddof=1)*np.sqrt(252)) if len(returns)>1 and np.std(returns,ddof=1)>0 else 0.0
-    return {"initial_balance":initial_balance,"final_balance":float(equity),"net_profit":float(equity-initial_balance),"return_pct":float((equity/initial_balance-1)*100),"profit_factor":float(wins.sum()/abs(losses.sum())) if len(losses) and len(wins) else (float("inf") if len(wins) else 0),"win_rate_pct":float(len(wins)/len(trades)*100) if trades else 0,"expectancy":float(pnls.mean()) if trades else 0,"max_drawdown_pct":float(max_dd*100),"sharpe_ratio":sharpe,"sharpe_assumption":"Ratio de Sharpe: media/desviación estándar de cambios de equity por barra, anualizada con sqrt(252); no es retorno diario; comparar solo misma temporalidad.","trade_count":len(trades),"commission_per_side":commission,"spread_price_units":spread,"slippage_price_units":slippage,"out_of_sample_start":d.iloc[split].time.isoformat(),"trades":trades,"equity_curve":curve}
+    return {"initial_balance":initial_balance,"final_balance":float(equity),"net_profit":float(equity-initial_balance),"return_pct":float((equity/initial_balance-1)*100),"profit_factor":float(wins.sum()/abs(losses.sum())) if len(losses) and len(wins) else (None if len(wins) else 0),"win_rate_pct":float(len(wins)/len(trades)*100) if trades else 0,"expectancy":float(pnls.mean()) if trades else 0,"max_drawdown_pct":float(max_dd*100),"sharpe_ratio":sharpe,"sharpe_assumption":"Ratio de Sharpe: media/desviación estándar de cambios de equity por barra, anualizada con sqrt(252); no es retorno diario; comparar solo misma temporalidad.","trade_count":len(trades),"commission_per_side":commission,"spread_price_units":spread,"slippage_price_units":slippage,"out_of_sample_start":d.iloc[split].time.isoformat(),"trades":trades,"equity_curve":curve}
