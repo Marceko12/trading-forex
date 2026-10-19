@@ -25,6 +25,8 @@ class FakeBroker:
     def account_info(self): return self.account
     def terminal_info(self): return self.terminal
     def constant(self, name): return self.constants.get(name)
+    def timeframe_value(self, name):
+        return {"M1": 1, "M5": 5, "M15": 15, "H1": 16385, "H4": 16388}.get(str(name).upper().removeprefix("TIMEFRAME_"))
     def symbol_info(self, symbol): return self.info
     def symbol_info_tick(self, symbol): return self.tick
     def positions_get(self, symbol=None): return self.positions
@@ -103,6 +105,16 @@ def test_order_check_rejection_and_mt5_disconnect_never_send_order():
     connected[0] = False
     disconnected.process_once()
     assert any("MT5 desconectado" in payload.get("reason", "") for _, payload in disconnect_logs)
+
+
+def test_auto_engine_rejects_invalid_mt5_timeframe_before_starting():
+    broker = FakeBroker()
+    engine, _ = make_engine(broker)
+    try:
+        engine.start(mode="PAPER", symbol="GOLDmicro", timeframe="D1", limits={}, background=False)
+        assert False, "Expected timeframe validation to reject D1"
+    except ValueError as exc:
+        assert "Temporalidad MT5 inválida: D1" in str(exc)
 
 
 def test_stale_quote_spread_and_risk_limits_block_entries():

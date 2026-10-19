@@ -65,6 +65,9 @@ class AutoTradingEngine:
             if not getattr(account, "trade_allowed", False) or not getattr(terminal, "trade_allowed", False):
                 raise ValueError("MT5 bloquea trading para esta cuenta o terminal.")
         if not symbol or not timeframe: raise ValueError("Símbolo y temporalidad son obligatorios.")
+        if self.adapter.timeframe_value(timeframe.upper()) is None:
+            raise ValueError(f"Temporalidad MT5 inválida: {timeframe}")
+        timeframe = timeframe.upper()
         normalized = dict(self._config)
         normalized.update(limits)
         if not 0 < float(normalized["risk_per_trade"]) <= .02: raise ValueError("Riesgo por operación fuera del rango (0, 2%].")

@@ -12,8 +12,9 @@ from typing import Callable
 import pandas as pd
 
 from .validation import validate_candles
+from ..mt5.adapter import TIMEFRAME_ATTRIBUTES
 
-TIMEFRAMES = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "M30": "TIMEFRAME_M30", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4"}
+TIMEFRAMES = dict(TIMEFRAME_ATTRIBUTES)
 FOREX = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD")
 FX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD", "CNH", "CNY", "HKD", "SGD", "MXN", "ZAR", "TRY", "PLN", "SEK", "NOK", "DKK", "HUF", "CZK", "ILS", "THB"}
 GOLD = ("GOLD", "XAUUSD")
@@ -77,6 +78,16 @@ def rates_to_frame(rates) -> pd.DataFrame:
     return validate_candles(frame)[CSV_COLUMNS]
 
 
+def candles_to_json(frame: pd.DataFrame) -> list[dict]:
+    """Serialize validated candle rows with stable UTC timestamps and native JSON scalars."""
+    candles=[]
+    for row in frame.itertuples(index=False):
+        timestamp=pd.Timestamp(row.time)
+        timestamp=timestamp.tz_localize("UTC") if timestamp.tzinfo is None else timestamp.tz_convert("UTC")
+        candles.append({"time":timestamp.isoformat().replace("+00:00","Z"),"open":float(row.open),"high":float(row.high),"low":float(row.low),"close":float(row.close),"tick_volume":int(row.tick_volume),"spread":int(row.spread),"real_volume":int(row.real_volume)})
+    return candles
+
+
 @dataclass
 class HistoryResult:
     symbol: str
@@ -97,6 +108,30 @@ class HistoryService:
         self.data_dir = Path(data_dir)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
+    def fetch_recent_closed(self, symbol: str, timeframe: str, count: int = 500) -> pd.DataFrame:
+        """Read recent closed bars from the connected terminal without persisting them."""
+        if not SYMBOL_RE.fullmatch(symbol):
+            raise ValueError("Nombre de símbolo inválido")
+        timeframe = timeframe.upper()
+        if timeframe not in TIMEFRAMES:
+            raise ValueError(f"Temporalidad no admitida: {timeframe}")
+        if not isinstance(count, int) or count < 1 or count > 2000:
+            raise ValueError("La cantidad de velas debe estar entre 1 y 2000")
+        if symbol not in self.mt5.symbols():
+            raise LookupError(f"El símbolo exacto {symbol} no existe en los símbolos del terminal")
+        if self.mt5.symbol_info(symbol) is None:
+            raise LookupError(f"MT5 no devuelve especificaciones para el símbolo {symbol}")
+        tf_value = self.mt5.timeframe_value(timeframe)
+        if tf_value is None:
+            raise ValueError(f"Temporalidad {timeframe} no disponible en MT5")
+        rates = self.mt5.copy_rates_from_pos(symbol, tf_value, 1, count)
+        if rates is None:
+            raise RuntimeError(f"MT5 devolvió None al solicitar velas cerradas de {symbol} {timeframe}: {self.mt5.last_error()}")
+        frame = rates_to_frame(rates)
+        if frame.empty:
+            raise FileNotFoundError(f"MT5 no devolvió velas cerradas para {symbol} {timeframe}; compruebe el historial del terminal")
+        return validate_candles(frame)[CSV_COLUMNS].reset_index(drop=True)
+
     def download(self, symbol: str, timeframe: str, start=None, end=None, progress=None) -> HistoryResult:
         if not SYMBOL_RE.fullmatch(symbol):
             raise ValueError("Nombre de símbolo inválido")
@@ -111,7 +146,7 @@ class HistoryService:
         start_dt = _aware(start, datetime(1970, 1, 1, tzinfo=timezone.utc))
         if start_dt >= end_dt:
             raise ValueError("La fecha inicial debe ser anterior a la fecha final")
-        timeframe_value = self.mt5.timeframe_value(TIMEFRAMES[timeframe])
+        timeframe_value = self.mt5.timeframe_value(timeframe)
         if timeframe_value is None:
             raise RuntimeError(f"Temporalidad {timeframe} no disponible en MT5")
 
@@ -199,7 +234,7 @@ class HistoryService:
             raise ValueError("La cantidad de velas debe estar entre 1 y 250000")
         if symbol not in self.mt5.symbols():
             raise ValueError(f"El símbolo exacto {symbol} no existe en los símbolos del terminal")
-        tf_value = self.mt5.timeframe_value(TIMEFRAMES[timeframe])
+        tf_value = self.mt5.timeframe_value(timeframe)
         if tf_value is None:
             raise RuntimeError(f"Temporalidad {timeframe} no disponible en MT5")
         rates = self.mt5.copy_rates_from_pos(symbol, tf_value, 1, count)
