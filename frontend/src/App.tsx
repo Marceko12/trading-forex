@@ -24,6 +24,7 @@ export default function App() {
   const [selected, setSelected] = useState('')
   const [selectedCompare, setSelectedCompare] = useState<string[]>([])
   const [timeframe, setTimeframe] = useState('H1')
+  const [candleCount, setCandleCount] = useState(5000)
   const [start, setStart] = useState('')
   const [end, setEnd] = useState('')
   const [job, setJob] = useState<any>(null)
@@ -32,14 +33,13 @@ export default function App() {
   const [backtestRows, setBacktestRows] = useState<any[]>([])
   const [vectorbtResult, setVectorbtResult] = useState<any | null>(null)
   const [initialBalance, setInitialBalance] = useState(10000)
-  const [risk, setRisk] = useState(0.005)
   const [spread, setSpread] = useState(0)
   const [commission, setCommission] = useState(0)
   const [slippage, setSlippage] = useState(0)
 
   async function load() {
     try {
-      const [a, b, c, d] = await Promise.all([fetch(`${API}/status`), fetch(`${API}/signals`), fetch(`${API}/positions`), fetch(`${API}/events`)])
+      const [a, b, c, d, e] = await Promise.all([fetch(`${API}/status`), fetch(`${API}/signals`), fetch(`${API}/positions`), fetch(`${API}/events`), fetch(`${API}/backtests?limit=10`)])
       const s = await a.json(); setStatus(s)
       setSignals((await b.json()).signals || [])
       const positionState = await c.json(); setPositions(positionState.positions || []); setPositionManager(positionState.manager || null)
@@ -49,6 +49,8 @@ export default function App() {
         managerConfigLoaded.current = true
       }
       setEvents((await d.json()).events || [])
+      const savedBacktests = (await e.json()).backtests || []
+      setBacktestRows(savedBacktests.map((item: any) => ({ ...item.result, id: item.id, symbol: item.symbol, created_at: item.created_at })))
       setError('')
       if (s.mt5.connected) {
         const response = await fetch(`${API}/history/symbols`)
@@ -151,6 +153,23 @@ export default function App() {
     finally { setBusy(false) }
   }
 
+  async function downloadRecentHistory() {
+    if (!selected) { setError('Elija el símbolo exacto de MT5 antes de descargar.'); return }
+    setBusy(true); setError(''); setJob({ status: 'queued', progress: { candles_received: 0 } })
+    try {
+      const r = await fetch(`${API}/history/download-count`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, timeframe, count: candleCount }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar la descarga')
+      let done = false
+      while (!done) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const jr = await fetch(`${API}/history/jobs/${value.job_id}`); const state = await jr.json(); setJob(state)
+        if (state.status === 'completed') { done = true; await refreshHistory(); await load() }
+        if (state.status === 'failed') { done = true; throw Error(state.error || 'MT5 no pudo descargar velas') }
+      }
+    } catch (e) { setError(String(e)); setJob((j: any) => ({ ...j, status: 'failed' })) }
+    finally { setBusy(false) }
+  }
+
   async function downloadTicks() {
     if (!selected || !start || !end) { setError('Seleccione símbolo, fecha inicial y fecha final para ticks.'); return }
     setBusy(true); setError(''); setTickResult(null)
@@ -178,36 +197,33 @@ export default function App() {
     } catch (e) { setError(String(e)) } finally { setBusy(false); event.target.value = '' }
   }
 
-  async function runBacktests(symbols: string[]) {
-    setBusy(true); setError('')
-    try {
-      const results: any[] = []
-      for (const symbol of symbols) {
-        const r = await fetch(`${API}/backtests`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol, timeframe, start: start || null, end: end || null, initial_balance: initialBalance, risk_per_trade: risk, spread, commission, slippage }) })
-        const value = await r.json(); if (!r.ok) throw Error(`${symbol}: ${value.detail || 'Error de backtest'}`)
-        results.push(value)
-      }
-      setBacktestRows(current => [...results, ...current])
-    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  async function requestVectorbt(symbol: string) {
+    const r = await fetch(`${API}/backtests/vectorbt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol, timeframe, start: start || null, end: end || null, initial_balance: initialBalance, spread, commission, slippage }) })
+    const value = await r.json(); if (!r.ok) throw Error(`${symbol}: ${value.detail || 'No se pudo iniciar el backtest VectorBT'}`)
+    let done = false
+    while (!done) {
+      await new Promise(resolve => setTimeout(resolve, 1000))
+      const jr = await fetch(`${API}/history/jobs/${value.job_id}`); const state = await jr.json()
+      if (state.status === 'completed') { done = true; return state.result }
+      if (state.status === 'failed') throw Error(state.error || `${symbol}: VectorBT no pudo ejecutar la simulación`)
+    }
+    throw Error(`${symbol}: el trabajo de VectorBT terminó sin resultado`)
   }
 
-  async function runVectorbt() {
-    if (!selected) { setError('Seleccione un símbolo con histórico descargado.'); return }
+  async function runBacktests(symbols: string[]) {
+    if (!symbols.length) return
     setBusy(true); setError(''); setVectorbtResult(null)
     try {
-      const r = await fetch(`${API}/backtests/vectorbt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, timeframe, start: start || null, end: end || null, initial_balance: initialBalance, risk_per_trade: risk, spread, commission, slippage }) })
-      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar el barrido VectorBT')
-      let done = false
-      while (!done) {
-        await new Promise(resolve => setTimeout(resolve, 1000))
-        const jr = await fetch(`${API}/history/jobs/${value.job_id}`); const state = await jr.json()
-        if (state.status === 'completed') { setVectorbtResult(state.result); done = true }
-        if (state.status === 'failed') { throw Error(state.error || 'El barrido VectorBT falló') }
-      }
+      const results: any[] = []
+      for (const symbol of symbols) results.push(await requestVectorbt(symbol))
+      setVectorbtResult(results[0])
+      setBacktestRows(current => [...results, ...current.filter(x => !results.some(r => r.id === x.id))])
     } catch (e) { setError(String(e)) } finally { setBusy(false) }
   }
 
   function toggleCompare(symbol: string) { setSelectedCompare(current => current.includes(symbol) ? current.filter(x => x !== symbol) : [...current, symbol]) }
+
+  const activeBacktest = vectorbtResult || backtestRows[0] || null
 
   return <main>
     <header><div><small>TRADING SYSTEM / CONTROL</small><h1>AI Trading Engine</h1></div><span className="badge">{status?.mode || '…'} · ORDENES DESACTIVADAS</span></header>
@@ -222,13 +238,14 @@ export default function App() {
     <section className="panel history-panel">
       <div className="sectionhead"><div><h2>Datos históricos</h2><span>Descarga directa de MT5 o importación de CSV</span></div><span className={status?.mt5.connected ? 'green' : 'red'}>MT5 {status?.mt5.connected ? 'conectado' : 'desconectado'}</span></div>
       {!status?.mt5.connected && <p className="muted">Conecte MT5 para descubrir símbolos del bróker y descargar datos. También puede importar un CSV existente en el símbolo seleccionado.</p>}
-      <div className="formgrid">
+      <div className="formgrid history-formgrid">
         <label>Símbolo exacto<input list="broker-symbols" value={selected} onChange={e => setSelected(e.target.value)} onBlur={e => void refreshHistory(e.target.value)} placeholder="p. ej. GOLDmicro" /><datalist id="broker-symbols">{matches.map((m, i) => <option key={`${m.symbol}-${i}`} value={m.symbol}>{m.instrument} · {m.variant}</option>)}</datalist></label>
         <label>Temporalidad<select value={timeframe} onChange={e => { setTimeframe(e.target.value); void refreshHistory(selected, e.target.value) }}>{TIMEFRAMES.map(tf => <option key={tf}>{tf}</option>)}</select></label>
         <label>Fecha inicial<input type="date" value={start} onChange={e => setStart(e.target.value)} /></label>
         <label>Fecha final<input type="date" value={end} onChange={e => setEnd(e.target.value)} /></label>
+        <label>Velas recientes<input type="number" min={1} max={250000} step={1} value={candleCount} onChange={e => setCandleCount(Math.max(1, Math.min(250000, Number(e.target.value) || 1)))} /></label>
       </div>
-      <div className="actions"><button onClick={detectSymbols} disabled={busy || !status?.mt5.connected}>Detectar instrumentos MT5</button><button onClick={downloadHistory} disabled={busy || !status?.mt5.connected || !selected || !start || !end}>Descargar velas</button><button onClick={downloadTicks} disabled={busy || !status?.mt5.connected || !selected || !start || !end}>Descargar ticks</button><label className="filebutton">Importar CSV existente<input type="file" accept=".csv,text/csv" onChange={importCsv} disabled={busy || !selected} /></label><button onClick={() => refreshHistory()} disabled={!selected}>Consultar CSV</button></div>
+      <div className="actions"><button onClick={detectSymbols} disabled={busy || !status?.mt5.connected}>Detectar instrumentos MT5</button><button onClick={downloadRecentHistory} disabled={busy || !status?.mt5.connected || !selected}>Descargar últimas {candleCount.toLocaleString()} velas</button><button onClick={downloadHistory} disabled={busy || !status?.mt5.connected || !selected || !start || !end}>Descargar por fechas</button><button onClick={downloadTicks} disabled={busy || !status?.mt5.connected || !selected || !start || !end}>Descargar ticks</button><label className="filebutton">Importar CSV existente<input type="file" accept=".csv,text/csv" onChange={importCsv} disabled={busy || !selected} /></label><button onClick={() => refreshHistory()} disabled={!selected}>Consultar CSV</button></div>
       {job && <div className="job"><b>Descarga: {job.status}</b>{job.status === 'running' && <><progress max={job.progress?.pages_total || 100} value={job.progress?.pages_done || 0} /><span>{job.progress?.candles_received || 0} velas recibidas · página {job.progress?.pages_done || 0} / {job.progress?.pages_total || '?'}</span></>}{job.result?.limitations?.map((x: string) => <p className="error" key={x}>{x}</p>)}</div>}
       {history && <div className="historyresult"><b>CSV validado: {history.symbol} {history.timeframe}</b><span>{history.count.toLocaleString()} velas</span><span>Cobertura: {new Date(history.first_time).toLocaleString()} — {new Date(history.last_time).toLocaleString()}</span><span>Proveedor: {history.metadata?.source || 'CSV local'}</span><span>Actualizado: {history.metadata?.downloaded_at ? new Date(history.metadata.downloaded_at).toLocaleString() : 'sin metadatos'}</span><span>{history.validation}</span></div>}
       {tickResult && <div className="historyresult"><b>Ticks MT5 · {tickResult.symbol}</b><span>{tickResult.count.toLocaleString()} ticks</span><span>{new Date(tickResult.first_time).toLocaleString()} — {new Date(tickResult.last_time).toLocaleString()}</span><span>{tickResult.csv_path}</span></div>}
@@ -236,13 +253,24 @@ export default function App() {
       {availableSymbols.length > 0 && <details className="available-symbols"><summary>Símbolos disponibles en el bróker ({availableSymbols.length})</summary><p>{availableSymbols.join(' · ')}</p></details>}
     </section>
 
-    <section className="panel">
-      <div className="sectionhead"><div><h2>Backtesting fuera de muestra</h2><span>Lee el CSV guardado para el símbolo y temporalidad seleccionados</span></div><div><button onClick={() => runBacktests([selected])} disabled={busy || !selected}>Ejecutar backtest</button><button onClick={runVectorbt} disabled={busy || !selected}>Barrido VectorBT</button><button onClick={() => runBacktests(selectedCompare)} disabled={busy || !selectedCompare.length}>Comparar seleccionados ({selectedCompare.length})</button></div></div>
-      <div className="formgrid costs"><label>Balance inicial<input type="number" value={initialBalance} min={1} onChange={e => setInitialBalance(Number(e.target.value))} /></label><label>Riesgo por operación<input type="number" value={risk} min={0.0001} max={0.02} step={0.001} onChange={e => setRisk(Number(e.target.value))} /></label><label>Spread (precio)<input type="number" value={spread} min={0} step="any" onChange={e => setSpread(Number(e.target.value))} /></label><label>Comisión por lote/lado<input type="number" value={commission} min={0} step="any" onChange={e => setCommission(Number(e.target.value))} /></label><label>Deslizamiento (precio)<input type="number" value={slippage} min={0} step="any" onChange={e => setSlippage(Number(e.target.value))} /></label></div>
-      {backtestRows.length ? <><div className="table"><div className="row btrow head"><span>Símbolo / TF</span><span>Beneficio neto</span><span>Profit factor</span><span>Acierto</span><span>Operaciones</span><span>Drawdown</span></div>{backtestRows.map((x, i) => <div className="row btrow" key={`${x.id}-${i}`}><b>{x.symbol} / {x.timeframe}</b><span>{Number(x.net_profit).toFixed(2)}</span><span>{x.profit_factor == null ? 'N/D' : Number(x.profit_factor).toFixed(2)}</span><span>{Number(x.win_rate_pct).toFixed(1)}%</span><span>{x.trade_count}</span><span>{Number(x.max_drawdown_pct).toFixed(2)}%</span></div>)}</div>{backtestRows.slice(0, 4).map((x, i) => <div key={`equity-${x.id}-${i}`} className="equity-result"><small>CURVA DE EQUITY · {x.symbol} {x.timeframe}</small><div className="chart">{x.equity_curve.map((p: any, j: number) => <i key={j} style={{ height: `${Math.max(2, Math.min(100, 50 + (p.equity - x.initial_balance) / x.initial_balance * 500))}%` }} title={`${p.time}: ${p.equity}`} />)}</div></div>)}</> : <p className="muted">Sin resultados. Descargue o importe histórico para habilitar el backtest.</p>}
-      {vectorbtResult && <div className="equity-result"><small>VECTORBT · {vectorbtResult.symbol} {vectorbtResult.timeframe} · {vectorbtResult.provider}</small><p>Estrategia seleccionada en entrenamiento: <b>{vectorbtResult.selected_strategy}</b> · resultado OOS: {Number(vectorbtResult.return_pct).toFixed(2)}% · drawdown: {Number(vectorbtResult.max_drawdown_pct).toFixed(2)}% · operaciones: {vectorbtResult.trade_count} · acierto: {Number(vectorbtResult.win_rate_pct).toFixed(1)}%</p><p className="muted">{vectorbtResult.execution}</p><div className="table"><div className="row head"><span>Combinación</span><span>Retorno entrenamiento</span><span>Selección OOS</span></div>{vectorbtResult.candidates.map((c: any) => <div className="row" key={c.strategy}><b>{c.strategy}</b><span>{Number(c.train_return_pct).toFixed(2)}%</span><span>{c.strategy === vectorbtResult.selected_strategy ? 'sí' : 'no'}</span></div>)}</div></div>}
-      {backtestRows.length > 0 && <div className="historyresult"><b>Bruto, neto y costes por backtest:</b>{backtestRows.map((x, i) => <span key={`cost-${x.id}-${i}`}>{x.symbol} {x.timeframe}: bruto {Number(x.gross_profit || 0).toFixed(2)} · neto {Number(x.net_profit).toFixed(2)} · costes {Number(x.total_costs || 0).toFixed(2)} (comisión {Number(x.commission_costs || 0).toFixed(2)} · spread {Number(x.spread_costs || 0).toFixed(2)} · slippage {Number(x.slippage_costs || 0).toFixed(2)})</span>)}</div>}
-      {vectorbtResult && <div className="equity-result"><b>Bruto: {Number(vectorbtResult.gross_profit).toFixed(2)} · neto: {Number(vectorbtResult.net_profit).toFixed(2)} · costes: {Number(vectorbtResult.total_costs).toFixed(2)}</b><div className="chart">{(vectorbtResult.equity_curve || []).map((p: any, j: number) => <i key={j} style={{ height: `${Math.max(2, Math.min(100, 50 + (p.equity - initialBalance) / initialBalance * 500))}%` }} title={`${p.time}: ${p.equity}`} />)}</div></div>}
+    <section className="panel backtest-panel">
+      <div className="sectionhead backtest-heading"><div><h2>Backtesting VectorBT fuera de muestra</h2><span>{selected || 'Sin símbolo'} · {timeframe} · selección en desarrollo, evaluación cronológica OOS</span></div><div className="actions"><button className="primary-action" onClick={() => runBacktests([selected])} disabled={busy || !selected}>{busy ? 'Ejecutando…' : 'Ejecutar backtest'}</button><button onClick={() => runBacktests(selectedCompare)} disabled={busy || !selectedCompare.length}>Comparar ({selectedCompare.length})</button></div></div>
+      <div className="formgrid costs backtest-controls"><label>Balance inicial<input type="number" value={initialBalance} min={1} onChange={e => setInitialBalance(Number(e.target.value))} /></label><label>Spread total (precio)<input type="number" value={spread} min={0} step="any" onChange={e => setSpread(Number(e.target.value))} /></label><label>Comisión fija por orden<input type="number" value={commission} min={0} step="any" onChange={e => setCommission(Number(e.target.value))} /></label><label>Deslizamiento por lado<input type="number" value={slippage} min={0} step="any" onChange={e => setSlippage(Number(e.target.value))} /></label></div>
+      {activeBacktest ? <>
+        <div className="backtest-summary"><div className="backtest-metrics">
+          <article><span>Retorno neto</span><strong>{Number(activeBacktest.net_profit).toFixed(2)}</strong><small>{Number(activeBacktest.return_pct).toFixed(2)}%</small></article>
+          <article><span>Drawdown máximo</span><strong>{Number(activeBacktest.max_drawdown_pct).toFixed(2)}%</strong></article>
+          <article><span>Operaciones</span><strong>{activeBacktest.trade_count}</strong></article>
+          <article><span>Profit factor</span><strong>{activeBacktest.profit_factor == null ? 'N/D' : Number(activeBacktest.profit_factor).toFixed(2)}</strong></article>
+          <article><span>Tasa de aciertos</span><strong>{Number(activeBacktest.win_rate_pct).toFixed(1)}%</strong></article>
+        </div>
+        <div className="equity-result compact-equity"><div><small>CURVA DE EQUITY · {activeBacktest.symbol} {activeBacktest.timeframe}</small><span>{activeBacktest.out_of_sample_start} → {activeBacktest.out_of_sample_end}</span></div><div className="chart compact-chart">{(activeBacktest.equity_curve || []).map((p: any, j: number) => <i key={j} style={{ height: `${Math.max(2, Math.min(100, 50 + (p.equity - activeBacktest.initial_balance) / activeBacktest.initial_balance * 500))}%` }} title={`${p.time}: ${p.equity}`} />)}</div></div>
+        </div>
+        <details className="backtest-details"><summary>Operaciones detalladas ({activeBacktest.trades?.length || 0})</summary><div className="table"><div className="row trade-row head"><span>Entrada</span><span>Salida</span><span>Unidades</span><span>Precios</span><span>Bruto / neto</span><span>Motivo salida</span></div>{(activeBacktest.trades || []).map((x: any, i: number) => <div className="row trade-row" key={i}><span>{x.entry_time}</span><span>{x.exit_time}</span><span>{Number(x.size_units).toFixed(4)}</span><span>{Number(x.entry_price).toFixed(3)} / {Number(x.exit_price).toFixed(3)}</span><span>{Number(x.gross_pnl).toFixed(2)} / {Number(x.net_pnl).toFixed(2)}</span><span>{x.exit_reason}</span></div>)}</div></details>
+        <details className="backtest-details"><summary>Señales y motivos ({activeBacktest.signals?.length || 0})</summary><p>{activeBacktest.strategy_description} · {activeBacktest.train_start} → {activeBacktest.out_of_sample_start} entrenamiento; OOS hasta {activeBacktest.out_of_sample_end}.</p><div className="table"><div className="row signal-row head"><span>Señal</span><span>Ejecución</span><span>Tipo</span><span>SMA rápida / lenta</span><span>Motivo</span></div>{(activeBacktest.signals || []).map((x: any, i: number) => <div className="row signal-row" key={i}><span>{x.time}</span><span>{x.fill_time}</span><b>{x.decision}</b><span>{Number(x.sma_fast).toFixed(3)} / {Number(x.sma_slow).toFixed(3)}</span><span>{x.reason}</span></div>)}</div></details>
+        <details className="backtest-details"><summary>Costes, supuestos y selección de estrategia</summary><p>Bruto {Number(activeBacktest.gross_profit || 0).toFixed(2)} · neto {Number(activeBacktest.net_profit).toFixed(2)} · costes {Number(activeBacktest.total_costs || 0).toFixed(2)} (comisión {Number(activeBacktest.commission_costs || 0).toFixed(2)} · spread {Number(activeBacktest.spread_costs || 0).toFixed(2)} · deslizamiento {Number(activeBacktest.slippage_costs || 0).toFixed(2)}).</p><p>{activeBacktest.execution}</p><p className="muted">Especificaciones MT5: {activeBacktest.contract_spec && Object.keys(activeBacktest.contract_spec).length ? JSON.stringify(activeBacktest.contract_spec) : 'no disponibles'}</p><div className="table"><div className="row head"><span>Combinación</span><span>Retorno entrenamiento</span><span>Seleccionada</span></div>{(activeBacktest.candidates || []).map((c: any) => <div className="row" key={c.strategy}><b>{c.strategy}</b><span>{Number(c.train_return_pct).toFixed(2)}%</span><span>{c.strategy === activeBacktest.selected_strategy ? 'sí' : 'no'}</span></div>)}</div></details>
+      </> : <p className="muted backtest-empty">Todavía no hay resultados guardados. Descarga histórico y ejecuta el backtest para ver métricas reales.</p>}
+      {backtestRows.length > 1 && <details className="backtest-details"><summary>Historial de ejecuciones ({backtestRows.length})</summary><div className="table"><div className="row btrow head"><span>Símbolo / TF</span><span>Beneficio neto</span><span>Profit factor</span><span>Acierto</span><span>Operaciones</span><span>Drawdown</span></div>{backtestRows.slice(1).map((x, i) => <div className="row btrow" key={`${x.id}-${i}`}><b>{x.symbol} / {x.timeframe}</b><span>{Number(x.net_profit).toFixed(2)}</span><span>{x.profit_factor == null ? 'N/D' : Number(x.profit_factor).toFixed(2)}</span><span>{Number(x.win_rate_pct).toFixed(1)}%</span><span>{x.trade_count}</span><span>{Number(x.max_drawdown_pct).toFixed(2)}%</span></div>)}</div></details>}
     </section>
 
     <section className="panel"><div className="sectionhead"><h2>Señales</h2><span>{status?.mt5.connected ? 'Velas cerradas consultadas desde MT5' : 'CSV local validado · reglas transparentes'}</span></div>{signals.length ? <div className="table"><div className="row head"><span>Símbolo / TF</span><span>Vela cerrada</span><span>Decisión</span><span>Entrada</span><span>SL / TP</span><span>Motivo</span></div>{signals.map((x, i) => <div className="row" key={i}><b>{x.symbol} / {x.timeframe}</b><span>{x.bar_time ? new Date(x.bar_time).toLocaleString() : '—'}</span><b>{x.decision}</b><span>{x.entry ?? '—'}</span><span>{x.stop_loss ?? '—'} / {x.take_profit ?? '—'}</span><span>{x.reason}</span></div>)}</div> : <p className="muted">No hay velas cerradas disponibles para evaluar.</p>}</section>
@@ -255,7 +283,7 @@ export default function App() {
       <details><summary>Reglas de gestión (requieren habilitación independiente)</summary><p className="muted">JSON de reglas: action = maintain, close o modify; origin = any, manual o automated; condiciones max_loss (negativo) o min_profit (positivo). modify requiere stop_loss y/o take_profit como precio absoluto. Sin habilitación, solo se supervisa. Las acciones REAL también requieren POSITION_MANAGER_ALLOW_REAL=true; permanece false hasta validar la gestión en DEMO.</p><textarea aria-label="Reglas de gestión de posiciones" rows={7} value={managerRules} onChange={e => setManagerRules(e.target.value)} spellCheck={false} /><div className="actions"><button onClick={addPositionRule} disabled={busy}>Añadir regla mantener</button><label><input type="checkbox" checked={managerEnabled} onChange={e => setManagerEnabled(e.target.checked)} /> Habilitar acciones automáticas configuradas</label></div><label>Para habilitar acciones en cuenta REAL, escriba HABILITAR GESTION REAL<input value={realManagementPhrase} onChange={e => setRealManagementPhrase(e.target.value)} autoComplete="off" /></label><button onClick={savePositionManagerConfig} disabled={busy}>Guardar configuración del Position Manager</button></details>
       <p className="muted">Clasificación: Magic 0 = manual; Magic distinto de 0 = automática (EA/bot), sin atribuirla a este motor. La gestión se desarma al desconectar o reiniciar el backend.</p>
     </section>
-    <section className="panel"><h2>Eventos y errores</h2>{events.length ? events.slice(0, 20).map(x => <p className="event" key={x.id}><b>{x.kind}</b> · {x.created_at} · {JSON.stringify(x.payload)}</p>) : <p className="muted">Sin eventos guardados.</p>}</section>
+    <section className="panel event-panel"><details><summary>Eventos y registros ({events.length})</summary>{events.length ? events.slice(0, 20).map(x => <p className="event" key={x.id}><b>{x.kind}</b> · {x.created_at} · {JSON.stringify(x.payload)}</p>) : <p className="muted">Sin eventos guardados.</p>}</details></section>
     <footer>Sin IA entrenada. Sin envío de órdenes. Los resultados históricos no garantizan resultados futuros.</footer>
   </main>
 }

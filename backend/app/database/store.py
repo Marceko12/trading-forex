@@ -22,6 +22,6 @@ class Store:
         with self._db() as db:
             cur = db.execute("INSERT INTO backtests(created_at,symbol,result) VALUES(?,?,?)", (datetime.now(timezone.utc).isoformat(),symbol,json.dumps(result, default=str)))
             return cur.lastrowid
-    def backtests(self):
-        with self._db() as db: rows=db.execute("SELECT id,created_at,symbol,result FROM backtests ORDER BY id DESC").fetchall()
+    def backtests(self, limit=20):
+        with self._db() as db: rows=db.execute("SELECT id,created_at,symbol,result FROM backtests ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [{"id":i,"created_at":t,"symbol":s,"result":json.loads(r)} for i,t,s,r in rows]

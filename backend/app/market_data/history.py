@@ -161,7 +161,7 @@ class HistoryService:
         info = self.mt5.symbol_info(symbol)
         spec = {}
         if info:
-            for source, target in (("trade_tick_size", "tick_size"), ("trade_tick_value", "tick_value"), ("volume_min", "volume_min"), ("volume_max", "volume_max"), ("volume_step", "volume_step")):
+            for source, target in (("trade_tick_size", "tick_size"), ("trade_tick_value", "tick_value"), ("volume_min", "volume_min"), ("volume_max", "volume_max"), ("volume_step", "volume_step"), ("trade_contract_size", "contract_size"), ("point", "point"), ("digits", "digits")):
                 value = getattr(info, source, None)
                 if value is not None:
                     spec[target] = float(value)
@@ -176,6 +176,67 @@ class HistoryService:
             limitations.append("MT5/terminal no entregó datos desde el inicio solicitado; el historial puede estar limitado por barras máximas del terminal o por datos del bróker.")
         if downloaded.time.max() < end_dt - timedelta(minutes=1):
             limitations.append("El histórico recibido termina antes del final solicitado; los periodos recientes pueden no tener vela cerrada.")
+        return HistoryResult(symbol, timeframe, len(downloaded), len(merged), merged.time.min().isoformat(), merged.time.max().isoformat(), str(active_csv), str(metadata_path), "válido: cronológico, OHLC consistente y sin timestamps duplicados", limitations)
+
+    def download_count(self, symbol: str, timeframe: str, count: int, progress=None) -> HistoryResult:
+        """Fetch the most recent *closed* bars via MT5 position indexing."""
+        if not SYMBOL_RE.fullmatch(symbol):
+            raise ValueError("Nombre de símbolo inválido")
+        timeframe = timeframe.upper()
+        if timeframe not in TIMEFRAMES:
+            raise ValueError(f"Temporalidad no admitida: {timeframe}")
+        if not isinstance(count, int) or count < 1 or count > 250000:
+            raise ValueError("La cantidad de velas debe estar entre 1 y 250000")
+        if symbol not in self.mt5.symbols():
+            raise ValueError(f"El símbolo exacto {symbol} no existe en los símbolos del terminal")
+        tf_value = self.mt5.timeframe_value(TIMEFRAMES[timeframe])
+        if tf_value is None:
+            raise RuntimeError(f"Temporalidad {timeframe} no disponible en MT5")
+        rates = self.mt5.copy_rates_from_pos(symbol, tf_value, 1, count)
+        error = self.mt5.last_error()
+        if rates is None:
+            raise RuntimeError(f"MT5 falló descargando {symbol} {timeframe} desde la posición 1, cantidad {count}: {error}")
+        downloaded = rates_to_frame(rates)
+        if downloaded.empty:
+            raise ValueError(f"MT5 no devolvió velas cerradas para {symbol} {timeframe} (solicitadas: {count}); compruebe el historial del terminal y el límite de barras")
+        downloaded = validate_candles(downloaded)[CSV_COLUMNS]
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        archive_dir = self.data_dir / "mt5" / symbol
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        archive_csv = archive_dir / f"{timeframe}.csv"
+        active_csv = self.data_dir / f"{symbol}.csv"
+        if archive_csv.exists():
+            try:
+                existing = validate_candles(pd.read_csv(archive_csv))[CSV_COLUMNS]
+            except Exception as exc:
+                raise ValueError(f"No se pudo combinar el CSV previo {archive_csv}: {exc}") from exc
+            merged = validate_candles(pd.concat([existing, downloaded], ignore_index=True))[CSV_COLUMNS]
+        else:
+            merged = downloaded
+        nonce = uuid4().hex
+        archive_tmp = archive_csv.with_name(f".{archive_csv.name}.{nonce}.tmp")
+        active_tmp = active_csv.with_name(f".{active_csv.name}.{nonce}.tmp")
+        merged.to_csv(archive_tmp, index=False)
+        merged.to_csv(active_tmp, index=False)
+        archive_tmp.replace(archive_csv)
+        active_tmp.replace(active_csv)
+        info = self.mt5.symbol_info(symbol)
+        spec = {}
+        if info:
+            for source, target in (("trade_tick_size", "tick_size"), ("trade_tick_value", "tick_value"), ("volume_min", "volume_min"), ("volume_max", "volume_max"), ("volume_step", "volume_step"), ("trade_contract_size", "contract_size"), ("point", "point"), ("digits", "digits")):
+                value = getattr(info, source, None)
+                if value is not None:
+                    spec[target] = float(value)
+            spec["currency_profit"] = getattr(info, "currency_profit", None)
+        now = self.clock()
+        metadata = {"symbol": symbol, "timeframe": timeframe, "requested_count": count, "downloaded_this_run": len(downloaded), "count": len(merged), "first_time": merged.time.min().isoformat(), "last_time": merged.time.max().isoformat(), "downloaded_at": now.isoformat(), "contract_spec": spec, "source": "MetaTrader5 terminal", "csv_path": str(active_csv), "archive_csv_path": str(archive_csv)}
+        metadata_path = archive_dir / f"{timeframe}.metadata.json"
+        meta_tmp = metadata_path.with_name(f".{metadata_path.name}.{nonce}.tmp")
+        meta_tmp.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        meta_tmp.replace(metadata_path)
+        limitations = []
+        if len(downloaded) < count:
+            limitations.append(f"MT5 entregó {len(downloaded)} de {count} velas solicitadas; el terminal o bróker puede limitar el histórico disponible.")
         return HistoryResult(symbol, timeframe, len(downloaded), len(merged), merged.time.min().isoformat(), merged.time.max().isoformat(), str(active_csv), str(metadata_path), "válido: cronológico, OHLC consistente y sin timestamps duplicados", limitations)
 
     def download_ticks(self, symbol: str, start, end, progress=None) -> dict:

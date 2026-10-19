@@ -5,7 +5,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
-from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest, PositionManagerConfigRequest
+from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, HistoryCountDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest, PositionManagerConfigRequest
 from .core.runner import AnalysisRunner
 from .database.store import Store
 from .mt5.adapter import MT5Adapter
@@ -158,7 +158,7 @@ def configure_position_manager(request: PositionManagerConfigRequest):
 def events(): return {"events":store.events()}
 
 @app.get("/api/backtests")
-def backtests(): return {"backtests":store.backtests()}
+def backtests(limit: int = 10): return {"backtests":store.backtests(max(1,min(limit,50)))}
 
 @app.get("/api/history/symbols")
 def history_symbols():
@@ -184,6 +184,27 @@ def download_history(request: HistoryDownloadRequest, background: BackgroundTask
         except Exception as exc:
             job["status"]="failed";job["error"]=str(exc)
             store.log("history_download_error",{"symbol":request.symbol,"timeframe":request.timeframe,"error":str(exc)})
+    background.add_task(run)
+    return {"job_id":job_id,"status":"queued"}
+
+@app.post("/api/history/download-count")
+def download_history_count(request: HistoryCountDownloadRequest, background: BackgroundTasks):
+    if not mt5_state.get("connected") or mt5._mt5 is None:
+        raise HTTPException(503,"MT5 está desconectado. Conecte el terminal antes de descargar histórico.")
+    if not SYMBOL_RE.fullmatch(request.symbol): raise HTTPException(400,"Símbolo inválido")
+    timeframe=request.timeframe.upper()
+    if timeframe not in TIMEFRAMES: raise HTTPException(400,f"Temporalidad no admitida: {timeframe}")
+    job_id=str(uuid.uuid4())
+    history_jobs[job_id]={"id":job_id,"status":"queued","kind":"history_count_download","progress":{"requested":request.count,"candles_received":0}}
+    def run():
+        job=history_jobs[job_id];job["status"]="running"
+        try:
+            result=HistoryService(mt5).download_count(request.symbol,timeframe,request.count)
+            job["result"]=result.__dict__;job["status"]="completed"
+            store.log("history_count_download",job["result"])
+        except Exception as exc:
+            job["status"]="failed";job["error"]=str(exc)
+            store.log("history_download_error",{"symbol":request.symbol,"timeframe":timeframe,"count":request.count,"error":str(exc)})
     background.add_task(run)
     return {"job_id":job_id,"status":"queued"}
 
@@ -227,8 +248,9 @@ def vectorbt_backtest(request: BacktestRequest, background: BackgroundTasks):
         try:
             from .backtesting.vectorbt_sweep import run_vectorbt_sweep
             result=run_vectorbt_sweep(frame,request.initial_balance,request.commission,request.spread,request.slippage,request.train_fraction)
-            result.update({"symbol":request.symbol,"timeframe":request.timeframe,"provider":metadata.get("source","CSV local")})
+            result.update({"symbol":request.symbol,"timeframe":request.timeframe,"provider":metadata.get("source","CSV local"),"contract_spec":metadata.get("contract_spec",{}),"requested_range":{"start":request.start,"end":request.end}})
             job["result"]=result;job["status"]="completed"
+            result["id"]=store.save_backtest(request.symbol,result)
             store.log("vectorbt_backtest",result)
         except Exception as exc:
             job["status"]="failed";job["error"]=str(exc)

@@ -20,9 +20,10 @@ class FakeMT5:
     def __init__(self, rates):
         self.rates = rates
         self.calls = []
+        self.position_calls = []
 
     def symbols(self):
-        return ["EURUSD", "EURUSDmicro", "xGOLDmicro", "XAUUSDm", "EURPLN"]
+        return ["EURUSD", "EURUSDmicro", "xGOLDmicro", "GOLDmicro", "XAUUSDm", "EURPLN"]
 
     def timeframe_value(self, name):
         return getattr(self, name)
@@ -31,6 +32,10 @@ class FakeMT5:
         self.calls.append((symbol, timeframe, start, end))
         return [r for r in self.rates if start.timestamp() <= r["time"] <= end.timestamp()]
 
+    def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
+        self.position_calls.append((symbol, timeframe, start_pos, count))
+        return self.rates[-count:]
+
     def copy_ticks_range(self, symbol, start, end):
         return [{"time_msc": int(start.timestamp()*1000)+i*1000, "bid":1.1+i*.00001, "ask":1.1001+i*.00001, "last":0, "volume":1, "volume_real":0, "flags":1} for i in range(3)]
 
@@ -38,6 +43,8 @@ class FakeMT5:
         return (0, "ok")
 
     def symbol_info(self, symbol):
+        if symbol == "GOLDmicro":
+            return SimpleNamespace(trade_tick_size=.01, trade_tick_value=.01, volume_min=.1, volume_max=100, volume_step=.01, trade_contract_size=1.0, point=.01, digits=2, currency_profit="USD")
         return SimpleNamespace(trade_tick_size=0.00001, trade_tick_value=1.0, volume_min=.01, volume_max=100, volume_step=.01, currency_profit="USD")
 
 
@@ -85,6 +92,23 @@ def test_download_paginates_and_merges_extended_range(tmp_path):
     result = service.download("EURUSD", "M1", start, start + timedelta(days=32))
     assert len(api.calls) == 2
     assert result.count_total == 120
+
+
+def test_download_recent_count_uses_closed_bar_position_and_exact_symbol_specs(tmp_path):
+    api = FakeMT5(rates(25))
+    result = HistoryService(api, tmp_path).download_count("GOLDmicro", "H1", 20)
+    assert api.position_calls == [("GOLDmicro", api.TIMEFRAME_H1, 1, 20)]
+    assert result.count_downloaded == 20
+    metadata = read_metadata("GOLDmicro", "H1", tmp_path)
+    assert metadata["contract_spec"]["tick_size"] == .01
+    assert metadata["contract_spec"]["volume_min"] == .1
+    assert metadata["contract_spec"]["contract_size"] == 1.0
+    assert len(read_history("GOLDmicro", "H1", tmp_path)) == 20
+
+
+def test_download_count_reports_mt5_exact_empty_response(tmp_path):
+    with pytest.raises(ValueError, match="no devolvió velas cerradas.*GOLDmicro H1"):
+        HistoryService(FakeMT5([]), tmp_path).download_count("GOLDmicro", "H1", 100)
 
 
 def test_empty_mt5_history_has_clear_error(tmp_path):

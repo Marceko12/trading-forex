@@ -7,6 +7,11 @@ class HistoryDownloadRequest(BaseModel):
     start: str
     end: str
 
+class HistoryCountDownloadRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    count: int = Field(default=5000, ge=1, le=250000)
+
 class Decision(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
