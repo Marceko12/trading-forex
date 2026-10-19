@@ -1,4 +1,5 @@
 import { ChangeEvent, useEffect, useRef, useState } from 'react'
+import CandlestickChart from './CandlestickChart'
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api'
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4']
@@ -6,10 +7,15 @@ type SymbolMatch = { symbol: string; instrument: string; micro: boolean; variant
 type Status = { mode: string; account_mode?: string; engine_running: boolean; paused: boolean; engine?: { last_scan?: string; scan_count: number; last_error?: string }; auto_trading?: any; mt5: { connected: boolean; error?: string; balance?: number; equity?: number }; symbols: string[]; risk: { per_trade: number; daily_loss_limit: number; max_drawdown: number }; execution_enabled: boolean }
 type PositionManagerStatus = { running: boolean; connected: boolean; stale: boolean; enabled: boolean; real_acknowledged: boolean; real_actions_allowed_by_config: boolean; interval_seconds: number; last_poll?: string; last_error?: string; position_count: number; positions: any[]; alerts: any[]; rules: any[] }
 type HistoryInfo = { symbol: string; timeframe: string; count: number; first_time: string; last_time: string; validation: string; metadata?: { source?: string; downloaded_at?: string; requested_start?: string; requested_end?: string } }
+type LiveCandle = { time: string; open: number; high: number; low: number; close: number; tick_volume: number; spread: number; real_volume: number }
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null)
   const [signals, setSignals] = useState<any[]>([])
+  const [liveCandles, setLiveCandles] = useState<LiveCandle[]>([])
+  const [candleError, setCandleError] = useState('')
+  const [candlesLoading, setCandlesLoading] = useState(false)
+  const [lastCandleReceived, setLastCandleReceived] = useState('')
   const [positions, setPositions] = useState<any[]>([])
   const [positionManager, setPositionManager] = useState<PositionManagerStatus | null>(null)
   const [managerEnabled, setManagerEnabled] = useState(false)
@@ -54,9 +60,8 @@ export default function App() {
 
   async function load() {
     try {
-      const [a, b, c, d, e] = await Promise.all([fetch(`${API}/status`), fetch(`${API}/signals`), fetch(`${API}/positions`), fetch(`${API}/events`), fetch(`${API}/backtests?limit=10`)])
+      const [a, c, d, e] = await Promise.all([fetch(`${API}/status`), fetch(`${API}/positions`), fetch(`${API}/events`), fetch(`${API}/backtests?limit=10`)])
       const s = await a.json(); setStatus(s)
-      setSignals((await b.json()).signals || [])
       const positionState = await c.json(); setPositions(positionState.positions || []); setPositionManager(positionState.manager || null)
       if (!managerConfigLoaded.current && positionState.manager) {
         setManagerEnabled(positionState.manager.enabled || false)
@@ -78,6 +83,42 @@ export default function App() {
   }
 
   useEffect(() => { void load(); const id = setInterval(() => void load(), 10000); return () => clearInterval(id) }, [])
+
+  useEffect(() => {
+    if (!selected || !status?.mt5.connected) {
+      setLiveCandles([]); setSignals([]); setCandleError(''); setLastCandleReceived('')
+      return
+    }
+    let active = true
+    let controller: AbortController | null = null
+    const key = `${selected}::${timeframe}`
+    setLiveCandles([]); setSignals([]); setCandleError(''); setLastCandleReceived(''); setCandlesLoading(true)
+    const refresh = async () => {
+      controller?.abort(); controller = new AbortController()
+      try {
+        const [candleResponse, signalResponse] = await Promise.all([
+          fetch(`${API}/market-data/candles/${encodeURIComponent(selected)}/${timeframe}?count=500`, { signal: controller.signal }),
+          fetch(`${API}/signals?symbol=${encodeURIComponent(selected)}&timeframe=${timeframe}`, { signal: controller.signal }),
+        ])
+        const candleData = await candleResponse.json()
+        if (!candleResponse.ok) throw Error(candleData.detail || `Error HTTP ${candleResponse.status} consultando velas`)
+        const signalData = await signalResponse.json()
+        if (!signalResponse.ok) throw Error(signalData.detail || `Error HTTP ${signalResponse.status} consultando señales`)
+        if (!active) return
+        if (`${candleData.symbol}::${candleData.timeframe}` !== key) return
+        setLiveCandles(Array.isArray(candleData.candles) ? candleData.candles : [])
+        setLastCandleReceived(candleData.last_candle_time || '')
+        setSignals(signalData.signals || [])
+        setCandleError(candleData.count ? '' : `MT5 no devolvió velas cerradas para ${selected} ${timeframe}`)
+      } catch (e) {
+        if (!active || (e instanceof DOMException && e.name === 'AbortError')) return
+        setCandleError(String(e).replace(/^Error: /, ''))
+      } finally { if (active) setCandlesLoading(false) }
+    }
+    void refresh()
+    const id = setInterval(() => void refresh(), 15000)
+    return () => { active = false; clearInterval(id); controller?.abort() }
+  }, [selected, timeframe, status?.mt5.connected])
 
   async function refreshPositions() {
     try {
@@ -317,6 +358,11 @@ export default function App() {
       {tickResult && <div className="historyresult"><b>Ticks MT5 · {tickResult.symbol}</b><span>{tickResult.count.toLocaleString()} ticks</span><span>{new Date(tickResult.first_time).toLocaleString()} — {new Date(tickResult.last_time).toLocaleString()}</span><span>{tickResult.csv_path}</span></div>}
       <div className="comparelist"><b>Comparar símbolos</b>{matches.length ? matches.map(m => <label key={`check-${m.symbol}`}><input type="checkbox" checked={selectedCompare.includes(m.symbol)} onChange={() => toggleCompare(m.symbol)} />{m.symbol}{m.micro ? ' (micro)' : ''}</label>) : <span className="muted">Los símbolos aparecerán al conectar MT5.</span>}</div>
       {availableSymbols.length > 0 && <details className="available-symbols"><summary>Símbolos disponibles en el bróker ({availableSymbols.length})</summary><p>{availableSymbols.join(' · ')}</p></details>}
+    </section>
+
+    <section className="panel live-candles-panel">
+      <div className="sectionhead"><div><h2>Velas MT5 · {selected || 'Sin símbolo'} · {timeframe}</h2><span>Datos reales del terminal, velas cerradas · refresco cada 15 s</span></div><span className={candlesLoading ? 'muted' : liveCandles.length ? 'green' : 'red'}>{candlesLoading ? 'Cargando…' : `${liveCandles.length} velas válidas`}</span></div>
+      {liveCandles.length > 0 ? <><CandlestickChart candles={liveCandles} /><div className="candle-meta"><span>Última vela recibida: {lastCandleReceived ? new Date(lastCandleReceived).toLocaleString() : '—'}</span><span>Fuente: MT5 · {selected} {timeframe}</span></div>{candleError && <p className="error">Actualización pendiente: {candleError}</p>}</> : candleError ? <p className="error">{candleError}</p> : <p className="muted">{!status?.mt5.connected ? 'Conecte MT5 para cargar velas.' : candlesLoading ? 'Solicitando velas cerradas al terminal…' : 'No hay datos para mostrar.'}</p>}
     </section>
 
     <section className="panel backtest-panel">

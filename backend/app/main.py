@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import io, json, uuid
 import pandas as pd
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
 from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, HistoryCountDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest, PositionManagerConfigRequest, AutoTradingStartRequest
@@ -43,7 +43,7 @@ def _scan_market(symbols, timeframe):
             frame=read_history(symbol,timeframe)
             signal=evaluate_signal(symbol,timeframe,frame,source="CSV local")
         key=(symbol,timeframe,signal["bar_time"])
-        signal_cache[symbol]=signal
+        signal_cache[(symbol,timeframe)]=signal
         results.append(signal)
         if key not in signal_bars:
             signal_bars.add(key); store.log("signal",signal)
@@ -130,14 +130,52 @@ def load_csv(symbol):
     except Exception as exc: raise HTTPException(400,f"CSV inválido: {exc}")
 
 @app.get("/api/signals")
-def signals():
-    result=list(signal_cache.values())
-    if not result:
-        for symbol in settings.symbols:
-            try: _scan_market([symbol],"H1")
-            except Exception: continue
+def signals(symbol: str | None = None, timeframe: str | None = None):
+    if (symbol is None) != (timeframe is None):
+        raise HTTPException(400,"Indique símbolo y temporalidad juntos")
+    if symbol is not None:
+        if not SYMBOL_RE.fullmatch(symbol): raise HTTPException(400,"Símbolo inválido")
+        timeframe=timeframe.upper()
+        if timeframe not in TIMEFRAMES: raise HTTPException(400,f"Temporalidad no admitida: {timeframe}")
+        try: result=_scan_market([symbol],timeframe)
+        except FileNotFoundError as exc: raise HTTPException(404,str(exc))
+        except ValueError as exc: raise HTTPException(422,str(exc))
+        except Exception as exc: raise HTTPException(503,str(exc))
+    else:
         result=list(signal_cache.values())
+        if not result:
+            for configured_symbol in settings.symbols:
+                try: _scan_market([configured_symbol],"H1")
+                except Exception: continue
+            result=list(signal_cache.values())
     return {"signals":result,"source":"MT5" if mt5_state.get("connected") else "CSV local","note":"Reglas deterministas evaluadas sobre velas cerradas; no es un modelo de IA entrenado"}
+
+@app.get("/api/market-data/candles/{symbol}/{timeframe}")
+def market_candles(symbol: str, timeframe: str, count: int = Query(500, ge=1, le=2000)):
+    if not SYMBOL_RE.fullmatch(symbol): raise HTTPException(400,"Símbolo inválido")
+    timeframe=timeframe.upper()
+    if timeframe not in TIMEFRAMES: raise HTTPException(400,f"Temporalidad no admitida: {timeframe}")
+    if not mt5_state.get("connected") or mt5._mt5 is None:
+        raise HTTPException(503,"MT5 desconectado; no se pueden consultar velas en vivo")
+    try:
+        terminal=mt5.terminal_info()
+        if terminal is None: raise RuntimeError(f"MT5 terminal_info() no disponible: {mt5.last_error()}")
+        if getattr(terminal,"connected",True) is False: raise RuntimeError("El terminal MT5 está desconectado del servidor del bróker")
+        account=mt5.account_info()
+        if account is None: raise RuntimeError(f"MT5 account_info() no disponible: {mt5.last_error()}")
+        frame=HistoryService(mt5).fetch_recent_closed(symbol,timeframe,count)
+        candles=[]
+        for row in frame.itertuples(index=False):
+            timestamp=pd.Timestamp(row.time)
+            if timestamp.tzinfo is None: timestamp=timestamp.tz_localize("UTC")
+            else: timestamp=timestamp.tz_convert("UTC")
+            candles.append({"time":timestamp.isoformat().replace("+00:00","Z"),"open":float(row.open),"high":float(row.high),"low":float(row.low),"close":float(row.close),"tick_volume":int(row.tick_volume),"spread":int(row.spread),"real_volume":int(row.real_volume)})
+    except LookupError as exc: raise HTTPException(404,str(exc))
+    except FileNotFoundError as exc: raise HTTPException(404,str(exc))
+    except ValueError as exc: raise HTTPException(422,str(exc))
+    except RuntimeError as exc: raise HTTPException(503,str(exc))
+    except Exception as exc: raise HTTPException(500,f"No se pudieron serializar las velas MT5: {exc}")
+    return {"symbol":symbol,"timeframe":timeframe,"source":"MT5","closed_only":True,"count":len(candles),"last_candle_time":candles[-1]["time"] if candles else None,"candles":candles}
 
 @app.get("/api/positions")
 def positions():

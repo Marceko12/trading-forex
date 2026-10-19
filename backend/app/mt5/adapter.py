@@ -14,16 +14,26 @@ class MT5Adapter:
                 return {"connected": False, "error": error}
             account = mt5.account_info()
             terminal = mt5.terminal_info()
+            if account is None or terminal is None:
+                error = str(mt5.last_error())
+                mt5.shutdown()
+                self._mt5 = None
+                return {"connected": False, "error": f"MT5 initialize() tuvo éxito, pero account_info() o terminal_info() no está disponible: {error}"}
+            if getattr(terminal, "connected", True) is False:
+                error = str(mt5.last_error())
+                mt5.shutdown()
+                self._mt5 = None
+                return {"connected": False, "error": f"Terminal MT5 desconectado del servidor: {error}"}
             mode = "UNKNOWN"
             if account is not None:
                 if getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_DEMO", object()): mode = "DEMO"
                 elif getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", object()): mode = "REAL"
                 elif getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", object()): mode = "CONTEST"
-            return {"connected": True, "account": account.login if account else None,
-                    "server": account.server if account else None,
-                    "balance": account.balance if account else None,
-                    "equity": account.equity if account else None, "account_mode": mode,
-                    "terminal": terminal.name if terminal else None}
+            return {"connected": True, "account": account.login,
+                    "server": account.server,
+                    "balance": account.balance,
+                    "equity": account.equity, "account_mode": mode,
+                    "terminal": terminal.name}
         except Exception as exc:
             if self._mt5:
                 try:
@@ -57,7 +67,7 @@ class MT5Adapter:
         if info is None: raise ValueError(f"Símbolo inexistente: {symbol}")
         if not info.visible and not self._mt5.symbol_select(symbol, True):
             raise RuntimeError(f"MT5 no pudo habilitar {symbol}: {self._mt5.last_error()}")
-        value=self.timeframe_value(timeframe)
+        value=self.timeframe_value(timeframe) if isinstance(timeframe,str) else timeframe
         if value is None: raise ValueError(f"Temporalidad MT5 inválida: {timeframe}")
         return self._mt5.copy_rates_from_pos(symbol,value,start_pos,count)
     def order_calc_margin(self, order_type, symbol, volume, price):

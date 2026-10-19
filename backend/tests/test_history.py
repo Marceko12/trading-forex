@@ -34,7 +34,7 @@ class FakeMT5:
 
     def copy_rates_from_pos(self, symbol, timeframe, start_pos, count):
         self.position_calls.append((symbol, timeframe, start_pos, count))
-        return self.rates[-count:]
+        return None if self.rates is None else self.rates[-count:]
 
     def copy_ticks_range(self, symbol, start, end):
         return [{"time_msc": int(start.timestamp()*1000)+i*1000, "bid":1.1+i*.00001, "ask":1.1001+i*.00001, "last":0, "volume":1, "volume_real":0, "flags":1} for i in range(3)]
@@ -109,6 +109,38 @@ def test_download_recent_count_uses_closed_bar_position_and_exact_symbol_specs(t
 def test_download_count_reports_mt5_exact_empty_response(tmp_path):
     with pytest.raises(ValueError, match="no devolvió velas cerradas.*GOLDmicro H1"):
         HistoryService(FakeMT5([]), tmp_path).download_count("GOLDmicro", "H1", 100)
+
+
+def test_recent_closed_bars_are_sorted_deduplicated_and_utc(tmp_path):
+    raw = rates(3)
+    api = FakeMT5([raw[2], raw[0], raw[0], raw[1]])
+    frame = HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "M1", 20)
+    assert api.position_calls[-1] == ("GOLDmicro", api.TIMEFRAME_M1, 1, 20)
+    assert len(frame) == 3
+    assert frame.time.is_monotonic_increasing
+    assert frame.time.is_unique
+    assert str(frame.time.dt.tz) == "UTC"
+    assert not (tmp_path / "GOLDmicro.csv").exists()
+
+
+def test_recent_closed_bars_distinguish_none_empty_and_unknown_symbol(tmp_path):
+    api = FakeMT5(None)
+    with pytest.raises(RuntimeError, match="devolvió None"):
+        HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1")
+    api.rates = []
+    with pytest.raises(FileNotFoundError, match="no devolvió velas cerradas"):
+        HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1")
+    with pytest.raises(LookupError, match="símbolo exacto"):
+        HistoryService(api, tmp_path).fetch_recent_closed("GOLD", "H1")
+
+
+def test_recent_closed_bars_reject_invalid_timeframe_and_invalid_timestamps(tmp_path):
+    api = FakeMT5(rates(1))
+    with pytest.raises(ValueError, match="Temporalidad no admitida"):
+        HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "D1")
+    api.rates = [{**rates(1)[0], "time": "not-a-timestamp"}]
+    with pytest.raises(ValueError, match="No hay velas válidas"):
+        HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1")
 
 
 def test_empty_mt5_history_has_clear_error(tmp_path):
