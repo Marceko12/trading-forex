@@ -1,15 +1,21 @@
-import { ChangeEvent, useEffect, useState } from 'react'
+import { ChangeEvent, useEffect, useRef, useState } from 'react'
 
 const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api'
 const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4']
 type SymbolMatch = { symbol: string; instrument: string; micro: boolean; variant: string }
 type Status = { mode: string; engine_running: boolean; paused: boolean; engine?: { last_scan?: string; scan_count: number; last_error?: string }; mt5: { connected: boolean; error?: string; balance?: number; equity?: number }; symbols: string[]; risk: { per_trade: number; daily_loss_limit: number; max_drawdown: number }; execution_enabled: boolean }
+type PositionManagerStatus = { running: boolean; connected: boolean; stale: boolean; enabled: boolean; real_acknowledged: boolean; real_actions_allowed_by_config: boolean; interval_seconds: number; last_poll?: string; last_error?: string; position_count: number; positions: any[]; alerts: any[]; rules: any[] }
 type HistoryInfo = { symbol: string; timeframe: string; count: number; first_time: string; last_time: string; validation: string; metadata?: { source?: string; downloaded_at?: string; requested_start?: string; requested_end?: string } }
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null)
   const [signals, setSignals] = useState<any[]>([])
   const [positions, setPositions] = useState<any[]>([])
+  const [positionManager, setPositionManager] = useState<PositionManagerStatus | null>(null)
+  const [managerEnabled, setManagerEnabled] = useState(false)
+  const [managerRules, setManagerRules] = useState('[]')
+  const [realManagementPhrase, setRealManagementPhrase] = useState('')
+  const managerConfigLoaded = useRef(false)
   const [events, setEvents] = useState<any[]>([])
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -35,7 +41,14 @@ export default function App() {
     try {
       const [a, b, c, d] = await Promise.all([fetch(`${API}/status`), fetch(`${API}/signals`), fetch(`${API}/positions`), fetch(`${API}/events`)])
       const s = await a.json(); setStatus(s)
-      setSignals((await b.json()).signals || []); setPositions((await c.json()).positions || []); setEvents((await d.json()).events || [])
+      setSignals((await b.json()).signals || [])
+      const positionState = await c.json(); setPositions(positionState.positions || []); setPositionManager(positionState.manager || null)
+      if (!managerConfigLoaded.current && positionState.manager) {
+        setManagerEnabled(positionState.manager.enabled || false)
+        setManagerRules(JSON.stringify(positionState.manager.rules || [], null, 2))
+        managerConfigLoaded.current = true
+      }
+      setEvents((await d.json()).events || [])
       setError('')
       if (s.mt5.connected) {
         const response = await fetch(`${API}/history/symbols`)
@@ -48,6 +61,36 @@ export default function App() {
   }
 
   useEffect(() => { void load(); const id = setInterval(() => void load(), 10000); return () => clearInterval(id) }, [])
+
+  async function refreshPositions() {
+    try {
+      const r = await fetch(`${API}/positions`)
+      if (!r.ok) return
+      const value = await r.json(); setPositions(value.positions || []); setPositionManager(value.manager || null)
+    } catch { /* The main refresh reports API connectivity errors. */ }
+  }
+
+  useEffect(() => { const id = setInterval(() => void refreshPositions(), 2000); return () => clearInterval(id) }, [])
+
+  async function savePositionManagerConfig() {
+    let rules: any[]
+    try { rules = JSON.parse(managerRules); if (!Array.isArray(rules)) throw Error('Las reglas deben ser un arreglo JSON.') }
+    catch (e) { setError(`Configuración de reglas inválida: ${String(e)}`); return }
+    setBusy(true); setError('')
+    try {
+      const r = await fetch(`${API}/position-manager/config`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: managerEnabled, rules, confirm_real: realManagementPhrase }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo guardar la configuración')
+      setPositionManager(value); setManagerRules(JSON.stringify(value.rules || [], null, 2)); setRealManagementPhrase(''); managerConfigLoaded.current = true
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  }
+
+  function addPositionRule() {
+    try {
+      const current = JSON.parse(managerRules)
+      if (!Array.isArray(current)) throw Error('Las reglas deben ser un arreglo.')
+      setManagerRules(JSON.stringify([...current, { id: `rule-${current.length + 1}`, action: 'maintain', origin: 'any' }], null, 2))
+    } catch (e) { setError(`No se pudo añadir la regla: ${String(e)}`) }
+  }
 
   async function post(path: string) {
     setBusy(true)
@@ -203,7 +246,15 @@ export default function App() {
     </section>
 
     <section className="panel"><div className="sectionhead"><h2>Señales</h2><span>{status?.mt5.connected ? 'Velas cerradas consultadas desde MT5' : 'CSV local validado · reglas transparentes'}</span></div>{signals.length ? <div className="table"><div className="row head"><span>Símbolo / TF</span><span>Vela cerrada</span><span>Decisión</span><span>Entrada</span><span>SL / TP</span><span>Motivo</span></div>{signals.map((x, i) => <div className="row" key={i}><b>{x.symbol} / {x.timeframe}</b><span>{x.bar_time ? new Date(x.bar_time).toLocaleString() : '—'}</span><b>{x.decision}</b><span>{x.entry ?? '—'}</span><span>{x.stop_loss ?? '—'} / {x.take_profit ?? '—'}</span><span>{x.reason}</span></div>)}</div> : <p className="muted">No hay velas cerradas disponibles para evaluar.</p>}</section>
-    <section className="panel"><h2>Posiciones MT5</h2>{positions.length ? <pre>{JSON.stringify(positions, null, 2)}</pre> : <p className="muted">{status?.mt5.connected ? 'No hay posiciones abiertas.' : 'Desconectado; posiciones no disponibles.'}</p>}</section>
+    <section className="panel position-manager">
+      <div className="sectionhead"><div><h2>Position Manager</h2><span>Supervisión MT5 independiente del motor de señales · sondeo cada {positionManager?.interval_seconds || 2} s</span></div><span className={positionManager?.connected ? 'green' : 'red'}>{positionManager?.connected ? (positionManager.stale ? 'Datos obsoletos' : 'MT5 conectado') : 'MT5 desconectado'}</span></div>
+      <div className="historyresult"><b>{positionManager?.running ? 'Supervisor activo' : 'Supervisor detenido'}</b><span>{positionManager?.position_count || 0} posiciones abiertas</span><span>Última consulta: {positionManager?.last_poll ? new Date(positionManager.last_poll).toLocaleTimeString() : 'sin datos MT5'}</span><span>Gestión automática: {positionManager?.enabled ? 'HABILITADA' : 'deshabilitada'}</span></div>
+      {positionManager?.last_error && <p className="error">Error del supervisor: {positionManager.last_error}</p>}
+      {positionManager?.alerts?.length ? <div className="error"><b>Protección incompleta</b>{positionManager.alerts.map((a: any) => <p key={a.ticket}>Ticket {a.ticket} · {a.symbol} ({a.origin}) · falta {a.missing_sl && a.missing_tp ? 'SL y TP' : a.missing_sl ? 'SL' : 'TP'}</p>)}</div> : <p className="muted">Sin alertas de SL/TP.</p>}
+      {positions.length ? <div className="table position-table"><div className="row head"><span>Ticket / símbolo</span><span>Origen / Magic</span><span>Volumen</span><span>Precio apertura / actual</span><span>SL / TP</span><span>Beneficio / riesgo a SL</span></div>{positions.map((p: any) => <div className="row" key={p.ticket}><b>{p.ticket} · {p.symbol} · {p.type_name}</b><span>{p.origin} · {p.magic}</span><span>{p.volume}</span><span>{p.price_open} / {p.price_current}</span><span>{p.sl || 'SIN SL'} / {p.tp || 'SIN TP'}</span><span>{Number(p.profit).toFixed(2)} / {p.risk_to_sl == null ? 'N/D' : Number(p.risk_to_sl).toFixed(2)}</span></div>)}</div> : <p className="muted">{positionManager?.connected ? 'No hay posiciones abiertas.' : 'Posiciones no disponibles mientras MT5 esté desconectado.'}</p>}
+      <details><summary>Reglas de gestión (requieren habilitación independiente)</summary><p className="muted">JSON de reglas: action = maintain, close o modify; origin = any, manual o automated; condiciones max_loss (negativo) o min_profit (positivo). modify requiere stop_loss y/o take_profit como precio absoluto. Sin habilitación, solo se supervisa. Las acciones REAL también requieren POSITION_MANAGER_ALLOW_REAL=true; permanece false hasta validar la gestión en DEMO.</p><textarea aria-label="Reglas de gestión de posiciones" rows={7} value={managerRules} onChange={e => setManagerRules(e.target.value)} spellCheck={false} /><div className="actions"><button onClick={addPositionRule} disabled={busy}>Añadir regla mantener</button><label><input type="checkbox" checked={managerEnabled} onChange={e => setManagerEnabled(e.target.checked)} /> Habilitar acciones automáticas configuradas</label></div><label>Para habilitar acciones en cuenta REAL, escriba HABILITAR GESTION REAL<input value={realManagementPhrase} onChange={e => setRealManagementPhrase(e.target.value)} autoComplete="off" /></label><button onClick={savePositionManagerConfig} disabled={busy}>Guardar configuración del Position Manager</button></details>
+      <p className="muted">Clasificación: Magic 0 = manual; Magic distinto de 0 = automática (EA/bot), sin atribuirla a este motor. La gestión se desarma al desconectar o reiniciar el backend.</p>
+    </section>
     <section className="panel"><h2>Eventos y errores</h2>{events.length ? events.slice(0, 20).map(x => <p className="event" key={x.id}><b>{x.kind}</b> · {x.created_at} · {JSON.stringify(x.payload)}</p>) : <p className="muted">Sin eventos guardados.</p>}</section>
     <footer>Sin IA entrenada. Sin envío de órdenes. Los resultados históricos no garantizan resultados futuros.</footer>
   </main>

@@ -48,3 +48,8 @@ class EngineStartRequest(BaseModel):
 class EnginePauseRequest(BaseModel):
     paused: bool
 
+class PositionManagerConfigRequest(BaseModel):
+    enabled: bool = False
+    rules: list[dict] = Field(default_factory=list)
+    confirm_real: str = ""
+

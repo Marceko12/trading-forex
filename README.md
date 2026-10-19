@@ -98,3 +98,23 @@ El botón **Iniciar análisis** arranca un hilo de análisis periódico (interva
 El modo inicial es `BACKTEST` y el indicador `execution_enabled` permanece apagado. La API no contiene una ruta de envío de órdenes habilitada en esta versión; las funciones del adaptador de MT5 no son llamadas por el motor de análisis. No se puede activar ejecución DEMO/PAPER desde el panel todavía. Esto conserva la instrucción de no enviar órdenes al bróker; el control de volumen, margen, deduplicación y límites de pérdidas deberá implementarse y probarse en una fase separada antes de habilitar cualquier flujo manual. REAL no está disponible.
 
 La persistencia guarda eventos y backtests en SQLite local; posiciones e información de cuenta se leen del terminal cuando está conectado. Las pruebas unitarias usan datos controlados solo para verificar lógica, nunca se presentan como backtests reales.
+
+## Position Manager MT5
+
+El Position Manager corre en un hilo separado del motor de señales y consulta `positions_get()` cada 2 segundos mientras MT5 está conectado. Detecta posiciones nuevas, cierres y cambios de volumen, SL, TP, precio, Magic y beneficio; registra los cambios en Eventos. Magic 0 se clasifica como manual y Magic distinto de 0 como automática (EA/bot). Adjunta las especificaciones actuales del símbolo y estima el riesgo monetario al SL solo cuando MT5 entrega tick size/value válidos. Avisa cuando falta SL o TP. La tabla refresca cada 2 segundos aunque el motor de señales esté detenido o pausado; al desconectarse muestra el último estado como obsoleto, nunca como dato actual.
+
+Por defecto la gestión automática está deshabilitada y no hay reglas. Para configurar reglas use `GET /api/position-manager` y `PUT /api/position-manager/config`. Una regla usa `action` (`maintain`, `close` o `modify`), `origin` (`any`, `manual`, `automated`), `symbol` opcional y una condición `max_loss` negativo y/o `min_profit` no negativo. `modify` requiere `stop_loss` o `take_profit` como precio absoluto. Ejemplo de observación y cierre condicionado:
+
+```json
+{
+  "enabled": false,
+  "rules": [
+    {"id":"proteger-eurusd","symbol":"EURUSD","origin":"any","action":"close","max_loss":-50}
+  ],
+  "confirm_real": ""
+}
+```
+
+El endpoint solo arma reglas al recibir explícitamente `enabled: true`. Comprueba que MT5 y la cuenta autoricen trading y que la cuenta esté identificada como DEMO o REAL. Las acciones REAL además están bloqueadas por configuración (`POSITION_MANAGER_ALLOW_REAL=false`); solo después de validar con DEMO se puede cambiar a `true` y el operador también debe escribir literalmente `HABILITAR GESTION REAL` en `confirm_real`. La habilitación de reglas no se guarda y se pierde al reiniciar o desconectar. Antes de modificar/cerrar vuelve a consultar ticket, símbolo y hora de apertura, tick reciente (máximo 30 segundos), cotización, restricciones de stops/freeze y especificaciones de volumen. No permite que una modificación aumente el riesgo del SL y limita el riesgo calculado a `RISK_PER_TRADE`. Solo informa éxito después de un retcode `TRADE_RETCODE_DONE` y de verificar que la posición desapareció o que MT5 muestra los nuevos niveles.
+
+La suite comprueba cambios, alertas, clasificación manual/automática y acciones usando un adaptador mock; no envía operaciones durante pruebas. No se pudo probar con cuenta demo en esta sesión porque MT5 estaba desconectado. Mantenga `enabled: false` hasta revisar las reglas y probarlas con demo.

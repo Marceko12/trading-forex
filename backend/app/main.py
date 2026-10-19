@@ -5,7 +5,7 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
-from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest
+from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest, TickDownloadRequest, EngineStartRequest, EnginePauseRequest, PositionManagerConfigRequest
 from .core.runner import AnalysisRunner
 from .database.store import Store
 from .mt5.adapter import MT5Adapter
@@ -15,6 +15,7 @@ from .backtesting.engine import run_backtest
 from .market_data.history import HistoryService, TIMEFRAMES, discover_symbols, read_history, read_ticks, read_metadata, CSV_COLUMNS, SYMBOL_RE, rates_to_frame
 from .market_data.validation import validate_candles
 from .strategies.signal_engine import evaluate_signal
+from .positions.manager import PositionManager
 
 app = FastAPI(title=settings.app_name, version="0.1.0", description="Motor inicial seguro: análisis y backtest; no envía órdenes.")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173","http://127.0.0.1:5173","http://localhost:5174","http://127.0.0.1:5174"], allow_methods=["*"], allow_headers=["*"])
@@ -45,6 +46,15 @@ def _scan_market(symbols, timeframe):
             signal_bars.add(key); store.log("signal",signal)
 
 runner=AnalysisRunner(_scan_market)
+position_manager=PositionManager(mt5,lambda: bool(mt5_state.get("connected") and mt5._mt5 is not None),store.log,settings.risk_per_trade,allow_real_actions=settings.position_manager_allow_real)
+
+@app.on_event("startup")
+def start_position_supervisor():
+    position_manager.start()
+
+@app.on_event("shutdown")
+def stop_position_supervisor():
+    position_manager.stop()
 
 def _filter_backtest_range(frame, start, end):
     if start:
@@ -71,7 +81,7 @@ def _read_or_download_history(request):
 @app.get("/api/status")
 def status():
     engine=runner.status()
-    return {"mode":runtime["mode"],"engine_running":engine["running"],"paused":engine["paused"],"engine":engine,"mt5":mt5_state,"symbols":list(settings.symbols),"risk":{"per_trade":settings.risk_per_trade,"daily_loss_limit":settings.daily_loss_limit,"max_drawdown":settings.max_drawdown},"execution_enabled":False}
+    return {"mode":runtime["mode"],"engine_running":engine["running"],"paused":engine["paused"],"engine":engine,"mt5":mt5_state,"position_manager":position_manager.status(),"symbols":list(settings.symbols),"risk":{"per_trade":settings.risk_per_trade,"daily_loss_limit":settings.daily_loss_limit,"max_drawdown":settings.max_drawdown},"execution_enabled":False}
 
 @app.post("/api/mt5/connect")
 def connect_mt5():
@@ -83,6 +93,7 @@ def connect_mt5():
 @app.post("/api/mt5/disconnect")
 def disconnect_mt5():
     global mt5_state
+    position_manager.disarm()
     runner.stop()
     mt5.disconnect(); mt5_state={"connected":False,"error":"Desconectado por el usuario"}
     return mt5_state
@@ -121,9 +132,27 @@ def signals():
 
 @app.get("/api/positions")
 def positions():
-    if not mt5_state.get("connected"): return {"available":False,"positions":[]}
-    rows=mt5.positions_get()
-    return {"available":True,"positions":[{"ticket":p.ticket,"symbol":p.symbol,"type":p.type,"volume":p.volume,"price_open":p.price_open,"sl":p.sl,"tp":p.tp,"profit":p.profit} for p in (rows or [])]}
+    if mt5_state.get("connected"):
+        try: position_manager.poll_once()
+        except Exception: pass
+    state=position_manager.status()
+    return {"available":state["connected"],"positions":state["positions"],"alerts":state["alerts"],"manager":state}
+
+@app.get("/api/position-manager")
+def position_manager_status():
+    if mt5_state.get("connected"):
+        try: position_manager.poll_once()
+        except Exception: pass
+    return position_manager.status()
+
+@app.put("/api/position-manager/config")
+def configure_position_manager(request: PositionManagerConfigRequest):
+    try:
+        state=position_manager.configure(request.enabled,request.rules,real_acknowledged=request.confirm_real == "HABILITAR GESTION REAL")
+    except ValueError as exc:
+        raise HTTPException(400,str(exc))
+    store.log("position_manager_config",{"enabled":state["enabled"],"rules":state["rules"],"real_acknowledged":state["real_acknowledged"]})
+    return state
 
 @app.get("/api/events")
 def events(): return {"events":store.events()}
