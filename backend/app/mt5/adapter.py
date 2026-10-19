@@ -1,4 +1,9 @@
 """Lazy MetaTrader 5 adapter. Callers still enforce the demo-only order gate."""
+
+TIMEFRAME_ATTRIBUTES = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15",
+                       "M30": "TIMEFRAME_M30", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4"}
+
+
 class MT5Adapter:
     def __init__(self, connect_timeout_ms=10000):
         self._mt5 = None
@@ -31,6 +36,7 @@ class MT5Adapter:
                 elif getattr(account, "trade_mode", None) == getattr(mt5, "ACCOUNT_TRADE_MODE_CONTEST", object()): mode = "CONTEST"
             return {"connected": True, "account": account.login,
                     "server": account.server,
+                    "currency": getattr(account, "currency", None),
                     "balance": account.balance,
                     "equity": account.equity, "account_mode": mode,
                     "terminal": terminal.name}
@@ -82,14 +88,18 @@ class MT5Adapter:
     def constant(self, name):
         return getattr(self._mt5,name,None) if self._mt5 else None
     def timeframe_value(self, name):
-        return getattr(self._mt5, name, None) if self._mt5 else None
+        if not self._mt5 or not isinstance(name, str): return None
+        attribute = TIMEFRAME_ATTRIBUTES.get(name.upper(), name if name.upper().startswith("TIMEFRAME_") else None)
+        return getattr(self._mt5, attribute, None) if attribute else None
     def copy_rates_range(self, symbol, timeframe, start, end):
         if not self._mt5: raise RuntimeError("MT5 desconectado")
         info = self._mt5.symbol_info(symbol)
         if info is None: raise ValueError(f"Símbolo inexistente: {symbol}")
         if not info.visible and not self._mt5.symbol_select(symbol, True):
             raise RuntimeError(f"MT5 no pudo habilitar {symbol}: {self._mt5.last_error()}")
-        return self._mt5.copy_rates_range(symbol, timeframe, start, end)
+        value=self.timeframe_value(timeframe) if isinstance(timeframe,str) else timeframe
+        if value is None: raise ValueError(f"Temporalidad MT5 inválida: {timeframe}")
+        return self._mt5.copy_rates_range(symbol, value, start, end)
     def copy_ticks_range(self, symbol, start, end):
         if not self._mt5: raise RuntimeError("MT5 desconectado")
         info = self._mt5.symbol_info(symbol)

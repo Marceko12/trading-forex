@@ -12,7 +12,7 @@ from .mt5.adapter import MT5Adapter
 from .strategies.baseline import decide
 from .strategies.indicators import add_indicators
 from .backtesting.engine import run_backtest
-from .market_data.history import HistoryService, TIMEFRAMES, discover_symbols, read_history, read_ticks, read_metadata, CSV_COLUMNS, SYMBOL_RE, rates_to_frame
+from .market_data.history import HistoryService, TIMEFRAMES, discover_symbols, read_history, read_ticks, read_metadata, CSV_COLUMNS, SYMBOL_RE, rates_to_frame, candles_to_json
 from .market_data.validation import validate_candles
 from .strategies.signal_engine import evaluate_signal
 from .positions.manager import PositionManager
@@ -29,10 +29,15 @@ signal_cache={}
 signal_bars=set()
 
 def _scan_market(symbols, timeframe):
+    timeframe=timeframe.upper()
+    if timeframe not in TIMEFRAMES:
+        raise ValueError(f"Temporalidad no admitida: {timeframe}")
     results=[]
     for symbol in symbols:
         if mt5_state.get("connected") and mt5._mt5 is not None:
-            rates=mt5.copy_rates_from_pos(symbol,timeframe,1,500)
+            timeframe_value=mt5.timeframe_value(timeframe)
+            if timeframe_value is None: raise ValueError(f"Temporalidad MT5 inválida: {timeframe}")
+            rates=mt5.copy_rates_from_pos(symbol,timeframe_value,1,500)
             error=mt5.last_error()
             if rates is None: raise RuntimeError(f"MT5 no devolvió velas de {symbol} {timeframe}: {error}")
             frame=rates_to_frame(rates)
@@ -89,7 +94,17 @@ def _read_or_download_history(request):
 def status():
     engine=runner.status()
     actual_mode=mt5_state.get("account_mode","UNKNOWN")
-    return {"mode":runtime["mode"],"account_mode":actual_mode,"engine_running":engine["running"],"paused":engine["paused"],"engine":engine,"auto_trading":auto_trader.status(),"mt5":mt5_state,"position_manager":position_manager.status(),"symbols":list(settings.symbols),"risk":{"per_trade":settings.risk_per_trade,"daily_loss_limit":settings.daily_loss_limit,"max_drawdown":settings.max_drawdown},"execution_enabled":auto_trader.status()["enabled"]}
+    mt5_view=dict(mt5_state)
+    if mt5_state.get("connected") and mt5._mt5 is not None:
+        try:
+            terminal=mt5.terminal_info(); account=mt5.account_info()
+            if terminal is None or account is None or getattr(terminal,"connected",True) is False:
+                mt5_view.update(connected=False,error=f"MT5 no devuelve terminal_info/account_info conectados: {mt5.last_error()}")
+            else:
+                mt5_view.update(account=account.login,server=account.server,currency=getattr(account,"currency",None),balance=account.balance,equity=account.equity)
+        except Exception as exc:
+            mt5_view.update(connected=False,error=f"No se pudo verificar el estado actual de MT5: {exc}")
+    return {"mode":runtime["mode"],"account_mode":actual_mode,"engine_running":engine["running"],"paused":engine["paused"],"engine":engine,"auto_trading":auto_trader.status(),"mt5":mt5_view,"position_manager":position_manager.status(),"symbols":list(settings.symbols),"risk":{"per_trade":settings.risk_per_trade,"daily_loss_limit":settings.daily_loss_limit,"max_drawdown":settings.max_drawdown},"execution_enabled":auto_trader.status()["enabled"]}
 
 @app.post("/api/mt5/connect")
 def connect_mt5():
@@ -164,12 +179,7 @@ def market_candles(symbol: str, timeframe: str, count: int = Query(500, ge=1, le
         account=mt5.account_info()
         if account is None: raise RuntimeError(f"MT5 account_info() no disponible: {mt5.last_error()}")
         frame=HistoryService(mt5).fetch_recent_closed(symbol,timeframe,count)
-        candles=[]
-        for row in frame.itertuples(index=False):
-            timestamp=pd.Timestamp(row.time)
-            if timestamp.tzinfo is None: timestamp=timestamp.tz_localize("UTC")
-            else: timestamp=timestamp.tz_convert("UTC")
-            candles.append({"time":timestamp.isoformat().replace("+00:00","Z"),"open":float(row.open),"high":float(row.high),"low":float(row.low),"close":float(row.close),"tick_volume":int(row.tick_volume),"spread":int(row.spread),"real_volume":int(row.real_volume)})
+        candles=candles_to_json(frame)
     except LookupError as exc: raise HTTPException(404,str(exc))
     except FileNotFoundError as exc: raise HTTPException(404,str(exc))
     except ValueError as exc: raise HTTPException(422,str(exc))

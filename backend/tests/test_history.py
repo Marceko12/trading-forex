@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 
-from app.market_data.history import HistoryService, discover_symbols, read_history, read_metadata
+from app.market_data.history import HistoryService, candles_to_json, discover_symbols, read_history, read_metadata
 from app.market_data.validation import validate_candles
 from app.backtesting.engine import run_backtest
 
@@ -26,7 +26,7 @@ class FakeMT5:
         return ["EURUSD", "EURUSDmicro", "xGOLDmicro", "GOLDmicro", "XAUUSDm", "EURPLN"]
 
     def timeframe_value(self, name):
-        return getattr(self, name)
+        return getattr(self, name if name.startswith("TIMEFRAME_") else f"TIMEFRAME_{name}")
 
     def copy_rates_range(self, symbol, timeframe, start, end):
         self.calls.append((symbol, timeframe, start, end))
@@ -141,6 +141,18 @@ def test_recent_closed_bars_reject_invalid_timeframe_and_invalid_timestamps(tmp_
     api.rates = [{**rates(1)[0], "time": "not-a-timestamp"}]
     with pytest.raises(ValueError, match="No hay velas válidas"):
         HistoryService(api, tmp_path).fetch_recent_closed("GOLDmicro", "H1")
+
+
+def test_candle_json_serialization_preserves_ohlc_volumes_and_utc_timestamp():
+    frame = HistoryService(FakeMT5(rates(1))).fetch_recent_closed("GOLDmicro", "H1")
+    candle = candles_to_json(frame)[0]
+    assert candle["time"].endswith("Z")
+    assert candle["open"] == pytest.approx(frame.iloc[0].open)
+    assert candle["high"] == pytest.approx(frame.iloc[0].high)
+    assert candle["low"] == pytest.approx(frame.iloc[0].low)
+    assert candle["close"] == pytest.approx(frame.iloc[0].close)
+    assert candle["tick_volume"] == int(frame.iloc[0].tick_volume)
+    assert candle["spread"] == int(frame.iloc[0].spread)
 
 
 def test_empty_mt5_history_has_clear_error(tmp_path):

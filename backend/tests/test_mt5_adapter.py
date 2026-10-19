@@ -1,5 +1,6 @@
 import sys
 from types import SimpleNamespace
+import pytest
 
 from app.mt5.adapter import MT5Adapter
 
@@ -66,3 +67,19 @@ def test_copy_rates_accepts_mt5_timeframe_constant_from_history_service():
     result = adapter.copy_rates_from_pos("GOLDmicro", 16385, 1, 10)
     assert result == [{"time": 1}]
     assert calls == [("GOLDmicro", 16385, 1, 10)]
+
+
+@pytest.mark.parametrize("name,attribute", [
+    ("M1", "TIMEFRAME_M1"), ("M5", "TIMEFRAME_M5"), ("M15", "TIMEFRAME_M15"),
+    ("H1", "TIMEFRAME_H1"), ("H4", "TIMEFRAME_H4"),
+])
+def test_timeframe_value_maps_selector_labels_to_mt5_constants(name, attribute):
+    adapter = MT5Adapter()
+    adapter._mt5 = SimpleNamespace(**{attribute: 100 + len(attribute)})
+    assert adapter.timeframe_value(name) == getattr(adapter._mt5, attribute)
+
+
+def test_timeframe_value_rejects_unknown_selector():
+    adapter = MT5Adapter()
+    adapter._mt5 = SimpleNamespace(TIMEFRAME_H1=16385)
+    assert adapter.timeframe_value("D1") is None
