@@ -1,10 +1,10 @@
 import { ChangeEvent, useEffect, useState } from 'react'
 
-const API = 'http://127.0.0.1:8000/api'
-const TIMEFRAMES = ['M1', 'M5', 'M15', 'H1', 'H4']
+const API = import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000/api'
+const TIMEFRAMES = ['M1', 'M5', 'M15', 'M30', 'H1', 'H4']
 type SymbolMatch = { symbol: string; instrument: string; micro: boolean; variant: string }
-type Status = { mode: string; engine_running: boolean; paused: boolean; mt5: { connected: boolean; error?: string; balance?: number; equity?: number }; symbols: string[]; risk: { per_trade: number; daily_loss_limit: number; max_drawdown: number }; execution_enabled: boolean }
-type HistoryInfo = { symbol: string; timeframe: string; count: number; first_time: string; last_time: string; validation: string }
+type Status = { mode: string; engine_running: boolean; paused: boolean; engine?: { last_scan?: string; scan_count: number; last_error?: string }; mt5: { connected: boolean; error?: string; balance?: number; equity?: number }; symbols: string[]; risk: { per_trade: number; daily_loss_limit: number; max_drawdown: number }; execution_enabled: boolean }
+type HistoryInfo = { symbol: string; timeframe: string; count: number; first_time: string; last_time: string; validation: string; metadata?: { source?: string; downloaded_at?: string; requested_start?: string; requested_end?: string } }
 
 export default function App() {
   const [status, setStatus] = useState<Status | null>(null)
@@ -21,8 +21,10 @@ export default function App() {
   const [start, setStart] = useState('')
   const [end, setEnd] = useState('')
   const [job, setJob] = useState<any>(null)
+  const [tickResult, setTickResult] = useState<any | null>(null)
   const [history, setHistory] = useState<HistoryInfo | null>(null)
   const [backtestRows, setBacktestRows] = useState<any[]>([])
+  const [vectorbtResult, setVectorbtResult] = useState<any | null>(null)
   const [initialBalance, setInitialBalance] = useState(10000)
   const [risk, setRisk] = useState(0.005)
   const [spread, setSpread] = useState(0)
@@ -53,14 +55,44 @@ export default function App() {
     catch (e) { setError(String(e)) } finally { setBusy(false) }
   }
 
+  async function startAnalysis() {
+    if (!selected) { setError('Seleccione un símbolo exacto antes de iniciar el análisis.'); return }
+    setBusy(true)
+    try {
+      const r = await fetch(`${API}/engine/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, timeframe }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar el análisis')
+      await load()
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  }
+
+  async function toggleAnalysisPause() {
+    setBusy(true)
+    try {
+      const r = await fetch(`${API}/engine/pause`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ paused: !status?.paused }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo pausar o reanudar')
+      await load()
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  }
+
   async function refreshHistory(symbol = selected, tf = timeframe) {
     if (!symbol) { setHistory(null); return }
     const r = await fetch(`${API}/history/${encodeURIComponent(symbol)}/${tf}`)
     if (r.ok) setHistory(await r.json()); else setHistory(null)
   }
 
+  async function detectSymbols() {
+    setBusy(true); setError('')
+    try {
+      const r = await fetch(`${API}/history/symbols`); const value = await r.json()
+      if (!r.ok) throw Error(value.detail || 'No se pudieron consultar los símbolos de MT5')
+      setMatches(value.matches || []); setAvailableSymbols(value.available || [])
+      if (!selected && value.matches?.length) setSelected(value.matches[0].symbol)
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  }
+
   async function downloadHistory() {
     if (!selected) { setError('Elija un símbolo exacto de MT5.'); return }
+    if (!start || !end) { setError('Seleccione fecha inicial y final para limitar la descarga.'); return }
     setBusy(true); setError(''); setJob({ status: 'queued', progress: { pages_done: 0, candles_received: 0 } })
     try {
       const r = await fetch(`${API}/history/download`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, timeframe, start: start ? `${start}T00:00:00Z` : null, end: end ? `${end}T23:59:59Z` : null }) })
@@ -74,6 +106,22 @@ export default function App() {
       }
     } catch (e) { setError(String(e)); setJob((j: any) => ({ ...j, status: 'failed' })) }
     finally { setBusy(false) }
+  }
+
+  async function downloadTicks() {
+    if (!selected || !start || !end) { setError('Seleccione símbolo, fecha inicial y fecha final para ticks.'); return }
+    setBusy(true); setError(''); setTickResult(null)
+    try {
+      const r = await fetch(`${API}/history/ticks/download`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, start: `${start}T00:00:00Z`, end: `${end}T23:59:59Z` }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar la descarga de ticks')
+      let done = false
+      while (!done) {
+        await new Promise(resolve => setTimeout(resolve, 1200))
+        const jr = await fetch(`${API}/history/jobs/${value.job_id}`); const state = await jr.json()
+        if (state.status === 'completed') { setTickResult(state.result); done = true }
+        if (state.status === 'failed') throw Error(state.error || 'MT5 no pudo descargar ticks')
+      }
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
   }
 
   async function importCsv(event: ChangeEvent<HTMLInputElement>) {
@@ -100,6 +148,22 @@ export default function App() {
     } catch (e) { setError(String(e)) } finally { setBusy(false) }
   }
 
+  async function runVectorbt() {
+    if (!selected) { setError('Seleccione un símbolo con histórico descargado.'); return }
+    setBusy(true); setError(''); setVectorbtResult(null)
+    try {
+      const r = await fetch(`${API}/backtests/vectorbt`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ symbol: selected, timeframe, start: start || null, end: end || null, initial_balance: initialBalance, risk_per_trade: risk, spread, commission, slippage }) })
+      const value = await r.json(); if (!r.ok) throw Error(value.detail || 'No se pudo iniciar el barrido VectorBT')
+      let done = false
+      while (!done) {
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const jr = await fetch(`${API}/history/jobs/${value.job_id}`); const state = await jr.json()
+        if (state.status === 'completed') { setVectorbtResult(state.result); done = true }
+        if (state.status === 'failed') { throw Error(state.error || 'El barrido VectorBT falló') }
+      }
+    } catch (e) { setError(String(e)) } finally { setBusy(false) }
+  }
+
   function toggleCompare(symbol: string) { setSelectedCompare(current => current.includes(symbol) ? current.filter(x => x !== symbol) : [...current, symbol]) }
 
   return <main>
@@ -109,7 +173,7 @@ export default function App() {
       <article><small>MT5</small><h2 className={status?.mt5.connected ? 'green' : 'red'}>{status?.mt5.connected ? 'Conectado' : 'Desconectado'}</h2><p>{status?.mt5.error || 'Cuenta conectada'}</p><button onClick={() => post('/mt5/connect')} disabled={busy}>Conectar MT5</button> <button onClick={() => post('/mt5/disconnect')} disabled={busy}>Desconectar</button></article>
       <article><small>BALANCE / EQUITY</small><h2>{status?.mt5.connected ? `${status.mt5.balance} / ${status.mt5.equity}` : '—'}</h2><p>Solo datos recibidos del terminal</p></article>
       <article><small>RIESGO CONFIGURADO</small><h2>{status ? `${(status.risk.per_trade * 100).toFixed(2)}% / operación` : '—'}</h2><p>Pérdida diaria {status ? status.risk.daily_loss_limit * 100 : '—'}% · DD {status ? status.risk.max_drawdown * 100 : '—'}%</p></article>
-      <article><small>MOTOR</small><h2>{status?.engine_running ? (status.paused ? 'Pausado' : 'Activo') : 'Detenido'}</h2><button onClick={() => post('/engine/start')} disabled={busy}>Iniciar análisis</button> <button onClick={() => post('/engine/pause')} disabled={busy}>Pausar / reanudar</button> <button onClick={() => post('/engine/stop')} disabled={busy}>Detener</button></article>
+      <article><small>MOTOR</small><h2>{status?.engine_running ? (status.paused ? 'Pausado' : 'Activo') : 'Detenido'}</h2><button onClick={startAnalysis} disabled={busy || !selected}>Iniciar análisis</button> <button onClick={toggleAnalysisPause} disabled={busy || !status?.engine_running}>{status?.paused ? 'Reanudar' : 'Pausar'}</button> <button onClick={() => post('/engine/stop')} disabled={busy || !status?.engine_running}>Detener</button><p>{status?.engine?.last_scan ? `Último análisis: ${new Date(status.engine.last_scan).toLocaleTimeString()} · ${status.engine.scan_count} ciclos` : 'Esperando análisis'}</p>{status?.engine?.last_error && <p className="error">{status.engine.last_error}</p>}</article>
     </section>
 
     <section className="panel history-panel">
@@ -121,20 +185,24 @@ export default function App() {
         <label>Fecha inicial<input type="date" value={start} onChange={e => setStart(e.target.value)} /></label>
         <label>Fecha final<input type="date" value={end} onChange={e => setEnd(e.target.value)} /></label>
       </div>
-      <div className="actions"><button onClick={downloadHistory} disabled={busy || !status?.mt5.connected || !selected}>Descargar histórico</button><label className="filebutton">Importar CSV existente<input type="file" accept=".csv,text/csv" onChange={importCsv} disabled={busy || !selected} /></label><button onClick={() => refreshHistory()} disabled={!selected}>Consultar CSV</button></div>
+      <div className="actions"><button onClick={detectSymbols} disabled={busy || !status?.mt5.connected}>Detectar instrumentos MT5</button><button onClick={downloadHistory} disabled={busy || !status?.mt5.connected || !selected || !start || !end}>Descargar velas</button><button onClick={downloadTicks} disabled={busy || !status?.mt5.connected || !selected || !start || !end}>Descargar ticks</button><label className="filebutton">Importar CSV existente<input type="file" accept=".csv,text/csv" onChange={importCsv} disabled={busy || !selected} /></label><button onClick={() => refreshHistory()} disabled={!selected}>Consultar CSV</button></div>
       {job && <div className="job"><b>Descarga: {job.status}</b>{job.status === 'running' && <><progress max={job.progress?.pages_total || 100} value={job.progress?.pages_done || 0} /><span>{job.progress?.candles_received || 0} velas recibidas · página {job.progress?.pages_done || 0} / {job.progress?.pages_total || '?'}</span></>}{job.result?.limitations?.map((x: string) => <p className="error" key={x}>{x}</p>)}</div>}
-      {history && <div className="historyresult"><b>CSV validado: {history.symbol} {history.timeframe}</b><span>{history.count.toLocaleString()} velas</span><span>{new Date(history.first_time).toLocaleString()} — {new Date(history.last_time).toLocaleString()}</span><span>{history.validation}</span></div>}
+      {history && <div className="historyresult"><b>CSV validado: {history.symbol} {history.timeframe}</b><span>{history.count.toLocaleString()} velas</span><span>Cobertura: {new Date(history.first_time).toLocaleString()} — {new Date(history.last_time).toLocaleString()}</span><span>Proveedor: {history.metadata?.source || 'CSV local'}</span><span>Actualizado: {history.metadata?.downloaded_at ? new Date(history.metadata.downloaded_at).toLocaleString() : 'sin metadatos'}</span><span>{history.validation}</span></div>}
+      {tickResult && <div className="historyresult"><b>Ticks MT5 · {tickResult.symbol}</b><span>{tickResult.count.toLocaleString()} ticks</span><span>{new Date(tickResult.first_time).toLocaleString()} — {new Date(tickResult.last_time).toLocaleString()}</span><span>{tickResult.csv_path}</span></div>}
       <div className="comparelist"><b>Comparar símbolos</b>{matches.length ? matches.map(m => <label key={`check-${m.symbol}`}><input type="checkbox" checked={selectedCompare.includes(m.symbol)} onChange={() => toggleCompare(m.symbol)} />{m.symbol}{m.micro ? ' (micro)' : ''}</label>) : <span className="muted">Los símbolos aparecerán al conectar MT5.</span>}</div>
       {availableSymbols.length > 0 && <details className="available-symbols"><summary>Símbolos disponibles en el bróker ({availableSymbols.length})</summary><p>{availableSymbols.join(' · ')}</p></details>}
     </section>
 
     <section className="panel">
-      <div className="sectionhead"><div><h2>Backtesting fuera de muestra</h2><span>Lee el CSV guardado para el símbolo y temporalidad seleccionados</span></div><div><button onClick={() => runBacktests([selected])} disabled={busy || !selected}>Ejecutar backtest</button><button onClick={() => runBacktests(selectedCompare)} disabled={busy || !selectedCompare.length}>Comparar seleccionados ({selectedCompare.length})</button></div></div>
+      <div className="sectionhead"><div><h2>Backtesting fuera de muestra</h2><span>Lee el CSV guardado para el símbolo y temporalidad seleccionados</span></div><div><button onClick={() => runBacktests([selected])} disabled={busy || !selected}>Ejecutar backtest</button><button onClick={runVectorbt} disabled={busy || !selected}>Barrido VectorBT</button><button onClick={() => runBacktests(selectedCompare)} disabled={busy || !selectedCompare.length}>Comparar seleccionados ({selectedCompare.length})</button></div></div>
       <div className="formgrid costs"><label>Balance inicial<input type="number" value={initialBalance} min={1} onChange={e => setInitialBalance(Number(e.target.value))} /></label><label>Riesgo por operación<input type="number" value={risk} min={0.0001} max={0.02} step={0.001} onChange={e => setRisk(Number(e.target.value))} /></label><label>Spread (precio)<input type="number" value={spread} min={0} step="any" onChange={e => setSpread(Number(e.target.value))} /></label><label>Comisión por lote/lado<input type="number" value={commission} min={0} step="any" onChange={e => setCommission(Number(e.target.value))} /></label><label>Deslizamiento (precio)<input type="number" value={slippage} min={0} step="any" onChange={e => setSlippage(Number(e.target.value))} /></label></div>
       {backtestRows.length ? <><div className="table"><div className="row btrow head"><span>Símbolo / TF</span><span>Beneficio neto</span><span>Profit factor</span><span>Acierto</span><span>Operaciones</span><span>Drawdown</span></div>{backtestRows.map((x, i) => <div className="row btrow" key={`${x.id}-${i}`}><b>{x.symbol} / {x.timeframe}</b><span>{Number(x.net_profit).toFixed(2)}</span><span>{x.profit_factor == null ? 'N/D' : Number(x.profit_factor).toFixed(2)}</span><span>{Number(x.win_rate_pct).toFixed(1)}%</span><span>{x.trade_count}</span><span>{Number(x.max_drawdown_pct).toFixed(2)}%</span></div>)}</div>{backtestRows.slice(0, 4).map((x, i) => <div key={`equity-${x.id}-${i}`} className="equity-result"><small>CURVA DE EQUITY · {x.symbol} {x.timeframe}</small><div className="chart">{x.equity_curve.map((p: any, j: number) => <i key={j} style={{ height: `${Math.max(2, Math.min(100, 50 + (p.equity - x.initial_balance) / x.initial_balance * 500))}%` }} title={`${p.time}: ${p.equity}`} />)}</div></div>)}</> : <p className="muted">Sin resultados. Descargue o importe histórico para habilitar el backtest.</p>}
+      {vectorbtResult && <div className="equity-result"><small>VECTORBT · {vectorbtResult.symbol} {vectorbtResult.timeframe} · {vectorbtResult.provider}</small><p>Estrategia seleccionada en entrenamiento: <b>{vectorbtResult.selected_strategy}</b> · resultado OOS: {Number(vectorbtResult.return_pct).toFixed(2)}% · drawdown: {Number(vectorbtResult.max_drawdown_pct).toFixed(2)}% · operaciones: {vectorbtResult.trade_count} · acierto: {Number(vectorbtResult.win_rate_pct).toFixed(1)}%</p><p className="muted">{vectorbtResult.execution}</p><div className="table"><div className="row head"><span>Combinación</span><span>Retorno entrenamiento</span><span>Selección OOS</span></div>{vectorbtResult.candidates.map((c: any) => <div className="row" key={c.strategy}><b>{c.strategy}</b><span>{Number(c.train_return_pct).toFixed(2)}%</span><span>{c.strategy === vectorbtResult.selected_strategy ? 'sí' : 'no'}</span></div>)}</div></div>}
+      {backtestRows.length > 0 && <div className="historyresult"><b>Bruto, neto y costes por backtest:</b>{backtestRows.map((x, i) => <span key={`cost-${x.id}-${i}`}>{x.symbol} {x.timeframe}: bruto {Number(x.gross_profit || 0).toFixed(2)} · neto {Number(x.net_profit).toFixed(2)} · costes {Number(x.total_costs || 0).toFixed(2)} (comisión {Number(x.commission_costs || 0).toFixed(2)} · spread {Number(x.spread_costs || 0).toFixed(2)} · slippage {Number(x.slippage_costs || 0).toFixed(2)})</span>)}</div>}
+      {vectorbtResult && <div className="equity-result"><b>Bruto: {Number(vectorbtResult.gross_profit).toFixed(2)} · neto: {Number(vectorbtResult.net_profit).toFixed(2)} · costes: {Number(vectorbtResult.total_costs).toFixed(2)}</b><div className="chart">{(vectorbtResult.equity_curve || []).map((p: any, j: number) => <i key={j} style={{ height: `${Math.max(2, Math.min(100, 50 + (p.equity - initialBalance) / initialBalance * 500))}%` }} title={`${p.time}: ${p.equity}`} />)}</div></div>}
     </section>
 
-    <section className="panel"><div className="sectionhead"><h2>Señales</h2><span>Datos CSV local · reglas transparentes</span></div>{signals.length ? <div className="table"><div className="row head"><span>Símbolo</span><span>Decisión</span><span>Entrada</span><span>SL / TP</span><span>Motivo</span></div>{signals.map((x, i) => <div className="row" key={i}><b>{x.symbol}</b><b>{x.decision}</b><span>{x.entry ?? '—'}</span><span>{x.stop_loss ?? '—'} / {x.take_profit ?? '—'}</span><span>{x.reason}</span></div>)}</div> : <p className="muted">No hay señales con los CSV locales.</p>}</section>
+    <section className="panel"><div className="sectionhead"><h2>Señales</h2><span>{status?.mt5.connected ? 'Velas cerradas consultadas desde MT5' : 'CSV local validado · reglas transparentes'}</span></div>{signals.length ? <div className="table"><div className="row head"><span>Símbolo / TF</span><span>Vela cerrada</span><span>Decisión</span><span>Entrada</span><span>SL / TP</span><span>Motivo</span></div>{signals.map((x, i) => <div className="row" key={i}><b>{x.symbol} / {x.timeframe}</b><span>{x.bar_time ? new Date(x.bar_time).toLocaleString() : '—'}</span><b>{x.decision}</b><span>{x.entry ?? '—'}</span><span>{x.stop_loss ?? '—'} / {x.take_profit ?? '—'}</span><span>{x.reason}</span></div>)}</div> : <p className="muted">No hay velas cerradas disponibles para evaluar.</p>}</section>
     <section className="panel"><h2>Posiciones MT5</h2>{positions.length ? <pre>{JSON.stringify(positions, null, 2)}</pre> : <p className="muted">{status?.mt5.connected ? 'No hay posiciones abiertas.' : 'Desconectado; posiciones no disponibles.'}</p>}</section>
     <section className="panel"><h2>Eventos y errores</h2>{events.length ? events.slice(0, 20).map(x => <p className="event" key={x.id}><b>{x.kind}</b> · {x.created_at} · {JSON.stringify(x.payload)}</p>) : <p className="muted">Sin eventos guardados.</p>}</section>
     <footer>Sin IA entrenada. Sin envío de órdenes. Los resultados históricos no garantizan resultados futuros.</footer>

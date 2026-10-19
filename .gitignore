@@ -2,6 +2,8 @@
 .env.*
 !.env.example
 __pycache__/
+.numba_cache/
+.numba-cache/
 *.py[cod]
 .pytest_cache/
 .pytest-tmp/

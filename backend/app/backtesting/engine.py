@@ -3,28 +3,57 @@ import pandas as pd
 import math
 from ..market_data.validation import validate_candles
 
-def run_backtest(frame, initial_balance=10_000, risk_fraction=.005, spread=0, commission=0, slippage=0, train_fraction=.7, contract_spec=None):
-    """Conservative next-bar execution; stop/target ambiguity resolves to stop first."""
+def run_backtest(frame, initial_balance=10_000, risk_fraction=.005, spread=0, commission=0, slippage=0, train_fraction=.7, contract_spec=None, ticks=None):
+    """Next-bar execution; ticks resolve same-candle SL/TP ambiguity when present."""
     from ..strategies.indicators import add_indicators
     d = add_indicators(validate_candles(frame))
+    tick_data = None
+    if ticks is not None and not ticks.empty and {"timestamp", "bid", "ask"}.issubset(ticks.columns):
+        tick_data=ticks.copy()
+        tick_data["timestamp"]=pd.to_datetime(tick_data["timestamp"],utc=True,errors="coerce")
+        tick_data["bid"]=pd.to_numeric(tick_data["bid"],errors="coerce")
+        tick_data["ask"]=pd.to_numeric(tick_data["ask"],errors="coerce")
+        tick_data=tick_data.dropna(subset=["timestamp","bid","ask"]).sort_values("timestamp",kind="stable").reset_index(drop=True)
     split = int(len(d) * train_fraction)
     if split < 60 or len(d)-split < 20: raise ValueError("Se requieren >=60 velas de entrenamiento y >=20 fuera de muestra")
     equity, peak, max_dd = initial_balance, initial_balance, 0.0
     trades=[]; curve=[]; position=None
+    total_commission=total_spread_cost=total_slippage_cost=0.0
+    total_gross_profit=0.0
     # Signals are computed from the completed prior bar and filled at current open.
     for i in range(split+1, len(d)):
         prior, bar = d.iloc[i-1], d.iloc[i]
         if position:
             hit_sl = bar.low <= position["sl"] if position["side"] == 1 else bar.high >= position["sl"]
             hit_tp = bar.high >= position["tp"] if position["side"] == 1 else bar.low <= position["tp"]
+            if hit_sl and hit_tp and tick_data is not None:
+                end_time=d.iloc[i+1].time if i+1 < len(d) else (bar.time+(bar.time-d.iloc[i-1].time) if i > 0 else bar.time)
+                left=tick_data.timestamp.searchsorted(bar.time,side="left")
+                right=tick_data.timestamp.searchsorted(end_time,side="left")
+                within=tick_data.iloc[left:right]
+                for tick in within.itertuples(index=False):
+                    executable=tick.bid if position["side"] == 1 else tick.ask
+                    if (executable <= position["sl"] if position["side"] == 1 else executable >= position["sl"]):
+                        hit_sl,hit_tp=True,False;break
+                    if (executable >= position["tp"] if position["side"] == 1 else executable <= position["tp"]):
+                        hit_sl,hit_tp=False,True;break
             if hit_sl or hit_tp:
                 raw_exit = position["sl"] if hit_sl else position["tp"]
                 exit_price = raw_exit - position["side"]*(spread/2+slippage)
                 price_pnl = (exit_price-position["entry"]) * position["side"]
                 gross_pnl = price_pnl * position["qty"] if position.get("tick_size") is None else price_pnl / position["tick_size"] * position["tick_value"] * position["qty"]
+                raw_entry=position["entry"]-position["side"]*(spread/2+slippage)
+                raw_gross=(raw_exit-raw_entry)*position["side"]*position["qty"] if position.get("tick_size") is None else (raw_exit-raw_entry)*position["side"]/position["tick_size"]*position["tick_value"]*position["qty"]
+                total_gross_profit+=raw_gross
                 trade_cost = commission * position["qty"] if position.get("tick_size") is not None else commission
+                price_cost = spread/2+slippage
+                friction = price_cost*2*position["qty"] if position.get("tick_size") is None else price_cost*2/position["tick_size"]*position["tick_value"]*position["qty"]
+                commission_cost = 2*trade_cost
+                total_commission += commission_cost
+                total_spread_cost += (spread*position["qty"] if position.get("tick_size") is None else spread/position["tick_size"]*position["tick_value"]*position["qty"])
+                total_slippage_cost += (2*slippage*position["qty"] if position.get("tick_size") is None else 2*slippage/position["tick_size"]*position["tick_value"]*position["qty"])
                 equity += gross_pnl - trade_cost
-                trades.append({**position,"exit":float(exit_price),"pnl":float(gross_pnl - 2*trade_cost),"duration_bars":i-position["index"],"exit_reason":"SL" if hit_sl else "TP"})
+                trades.append({**position,"exit":float(exit_price),"gross_pnl":float(raw_gross),"pnl":float(gross_pnl - commission_cost),"costs":float(friction+commission_cost),"duration_bars":i-position["index"],"exit_reason":"SL" if hit_sl else "TP"})
                 position=None
         if position is None and pd.notna(prior.atr) and pd.notna(prior.adx) and prior.adx >= 18:
             long = prior.ema_fast > prior.ema_slow and prior.macd > prior.macd_signal and 45 <= prior.rsi <= 70
@@ -48,10 +77,19 @@ def run_backtest(frame, initial_balance=10_000, risk_fraction=.005, spread=0, co
         peak=max(peak,equity); max_dd=max(max_dd,(peak-equity)/peak if peak else 0)
         curve.append({"time":bar.time.isoformat(),"equity":float(equity)})
     if position:
-        last=float(d.iloc[-1].close)-position["side"]*(spread/2+slippage); price_pnl=(last-position["entry"])*position["side"]
+        raw_last=float(d.iloc[-1].close)
+        last=raw_last-position["side"]*(spread/2+slippage); price_pnl=(last-position["entry"])*position["side"]
         gross_pnl=price_pnl*position["qty"] if position.get("tick_size") is None else price_pnl/position["tick_size"]*position["tick_value"]*position["qty"]
+        raw_entry=position["entry"]-position["side"]*(spread/2+slippage)
+        raw_gross=(raw_last-raw_entry)*position["side"]*position["qty"] if position.get("tick_size") is None else (raw_last-raw_entry)*position["side"]/position["tick_size"]*position["tick_value"]*position["qty"]
+        total_gross_profit+=raw_gross
         trade_cost=commission*position["qty"] if position.get("tick_size") is not None else commission
-        equity+=gross_pnl-trade_cost; trades.append({**position,"exit":last,"pnl":float(gross_pnl-2*trade_cost),"duration_bars":len(d)-1-position["index"],"exit_reason":"END"})
+        friction=(spread/2+slippage)*2*position["qty"] if position.get("tick_size") is None else (spread/2+slippage)*2/position["tick_size"]*position["tick_value"]*position["qty"]
+        commission_cost=2*trade_cost
+        total_commission+=commission_cost
+        total_spread_cost+=spread*position["qty"] if position.get("tick_size") is None else spread/position["tick_size"]*position["tick_value"]*position["qty"]
+        total_slippage_cost+=2*slippage*position["qty"] if position.get("tick_size") is None else 2*slippage/position["tick_size"]*position["tick_value"]*position["qty"]
+        equity+=gross_pnl-trade_cost; trades.append({**position,"exit":last,"gross_pnl":float(raw_gross),"pnl":float(gross_pnl-commission_cost),"costs":float(friction+commission_cost),"duration_bars":len(d)-1-position["index"],"exit_reason":"END"})
         if curve:
             curve[-1]["equity"] = float(equity)
         peak=max(peak,equity); max_dd=max(max_dd,(peak-equity)/peak if peak else 0)
@@ -59,4 +97,4 @@ def run_backtest(frame, initial_balance=10_000, risk_fraction=.005, spread=0, co
     wins=pnls[pnls>0]; losses=pnls[pnls<0]
     returns=np.diff(np.array([initial_balance]+[x["equity"] for x in curve]))
     sharpe=float(np.mean(returns)/np.std(returns,ddof=1)*np.sqrt(252)) if len(returns)>1 and np.std(returns,ddof=1)>0 else 0.0
-    return {"initial_balance":initial_balance,"final_balance":float(equity),"net_profit":float(equity-initial_balance),"return_pct":float((equity/initial_balance-1)*100),"profit_factor":float(wins.sum()/abs(losses.sum())) if len(losses) and len(wins) else (None if len(wins) else 0),"win_rate_pct":float(len(wins)/len(trades)*100) if trades else 0,"expectancy":float(pnls.mean()) if trades else 0,"max_drawdown_pct":float(max_dd*100),"sharpe_ratio":sharpe,"sharpe_assumption":"Ratio de Sharpe: media/desviación estándar de cambios de equity por barra, anualizada con sqrt(252); no es retorno diario; comparar solo misma temporalidad.","trade_count":len(trades),"commission_per_side":commission,"spread_price_units":spread,"slippage_price_units":slippage,"out_of_sample_start":d.iloc[split].time.isoformat(),"trades":trades,"equity_curve":curve}
+    return {"initial_balance":initial_balance,"final_balance":float(equity),"gross_profit":float(total_gross_profit),"net_profit":float(equity-initial_balance),"return_pct":float((equity/initial_balance-1)*100),"profit_factor":float(wins.sum()/abs(losses.sum())) if len(losses) and len(wins) else (None if len(wins) else 0),"win_rate_pct":float(len(wins)/len(trades)*100) if trades else 0,"expectancy":float(pnls.mean()) if trades else 0,"max_drawdown_pct":float(max_dd*100),"sharpe_ratio":sharpe,"sharpe_assumption":"Ratio de Sharpe: media/desviación estándar de cambios de equity por barra, anualizada con sqrt(252); no es retorno diario; comparar solo misma temporalidad.","trade_count":len(trades),"total_costs":float(total_commission+total_spread_cost+total_slippage_cost),"commission_costs":float(total_commission),"spread_costs":float(total_spread_cost),"slippage_costs":float(total_slippage_cost),"commission_per_side":commission,"spread_price_units":spread,"slippage_price_units":slippage,"out_of_sample_start":d.iloc[split].time.isoformat(),"out_of_sample_end":d.iloc[-1].time.isoformat(),"data_count":len(d),"trades":trades,"equity_curve":curve}

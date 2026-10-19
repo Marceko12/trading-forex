@@ -87,10 +87,14 @@ git push -u origin master
 
 No se creó ni se publicó un repositorio remoto. Antes del push inspeccione los archivos que va a incluir; `.env`, bases de datos, logs, CSV e informes están ignorados.
 
-## Limitaciones actuales
+## Motor de análisis y señales
 
-- Sin ejecución de órdenes, modo REAL, modificación de posiciones, conciliación de órdenes pendientes ni motor persistente de trading.
-- El botón de iniciar controla el estado visual del análisis, pero no inicia un proceso de escaneo periódico.
-- Sin histórico de mercado integrado: señales y backtest necesitan CSV local; MT5 se usa para conectividad, cotización y posiciones.
-- La persistencia guarda eventos y backtests en SQLite local; las posiciones se leen directamente de MT5.
-- Curva de equity presentada desde datos reales de backtest; no hay cifras de demo.
+El botón **Iniciar análisis** arranca un hilo de análisis periódico (intervalo de 5 segundos) para el símbolo y temporalidad seleccionados. El panel muestra los ciclos completados, el último error y permite pausar, reanudar y detener el trabajador. El proceso reinicia detenido con el backend; no afirma continuar un ciclo anterior. Con MT5 conectado usa barras cerradas vía `copy_rates_from_pos` y la cotización actual. Sin MT5 lee el CSV histórico seleccionado. Las señales documentan la vela, el origen, el spread y los parámetros; los eventos se guardan una sola vez por vela. La estrategia es EMA/RSI/MACD/ADX determinista, no IA entrenada.
+
+`GET /api/mt5/account` informa cuenta, moneda, margen, permisos y estado del terminal únicamente cuando MT5 responde. Las posiciones y ticks también son consultas directas al terminal. Si falta el archivo para un backtest, la API intenta descargar un año acotado desde MT5; si falla, devuelve el error recibido y mantiene la necesidad de historial suficiente del bróker.
+
+## Seguridad de ejecución
+
+El modo inicial es `BACKTEST` y el indicador `execution_enabled` permanece apagado. La API no contiene una ruta de envío de órdenes habilitada en esta versión; las funciones del adaptador de MT5 no son llamadas por el motor de análisis. No se puede activar ejecución DEMO/PAPER desde el panel todavía. Esto conserva la instrucción de no enviar órdenes al bróker; el control de volumen, margen, deduplicación y límites de pérdidas deberá implementarse y probarse en una fase separada antes de habilitar cualquier flujo manual. REAL no está disponible.
+
+La persistencia guarda eventos y backtests en SQLite local; posiciones e información de cuenta se leen del terminal cuando está conectado. Las pruebas unitarias usan datos controlados solo para verificar lógica, nunca se presentan como backtests reales.

@@ -4,8 +4,8 @@ from pydantic import BaseModel, Field
 class HistoryDownloadRequest(BaseModel):
     symbol: str
     timeframe: str
-    start: str | None = None
-    end: str | None = None
+    start: str
+    end: str
 
 class Decision(str, Enum):
     BUY = "BUY"
@@ -34,4 +34,17 @@ class BacktestRequest(BaseModel):
     train_fraction: float = Field(default=0.7, gt=0.5, lt=0.9)
     start: str | None = None
     end: str | None = None
+
+class TickDownloadRequest(BaseModel):
+    symbol: str
+    start: str
+    end: str
+
+class EngineStartRequest(BaseModel):
+    symbols: list[str] | None = None
+    symbol: str | None = None
+    timeframe: str = "H1"
+
+class EnginePauseRequest(BaseModel):
+    paused: bool
 

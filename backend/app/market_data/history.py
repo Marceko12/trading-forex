@@ -13,11 +13,12 @@ import pandas as pd
 
 from .validation import validate_candles
 
-TIMEFRAMES = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4"}
+TIMEFRAMES = {"M1": "TIMEFRAME_M1", "M5": "TIMEFRAME_M5", "M15": "TIMEFRAME_M15", "M30": "TIMEFRAME_M30", "H1": "TIMEFRAME_H1", "H4": "TIMEFRAME_H4"}
 FOREX = ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "USDCHF", "NZDUSD")
+FX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD", "NZD", "CNH", "CNY", "HKD", "SGD", "MXN", "ZAR", "TRY", "PLN", "SEK", "NOK", "DKK", "HUF", "CZK", "ILS", "THB"}
 GOLD = ("GOLD", "XAUUSD")
 SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-PAGE_DAYS = {"M1": 30, "M5": 90, "M15": 180, "H1": 730, "H4": 1460}
+PAGE_DAYS = {"M1": 30, "M5": 90, "M15": 180, "M30": 365, "H1": 730, "H4": 1460}
 CSV_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume", "spread", "real_volume"]
 
 
@@ -31,12 +32,26 @@ def discover_symbols(names: list[str]) -> dict:
     matches = []
     for name in available:
         normalized = _canonical(name)
+        found = False
         for instrument in (*GOLD, *FOREX):
             if instrument in normalized:
                 idx = normalized.index(instrument)
                 remainder = normalized[:idx] + normalized[idx + len(instrument):]
                 is_micro = "MICRO" in remainder or normalized.startswith("M" + instrument) or normalized.endswith(instrument + "M")
-                matches.append({"symbol": name, "instrument": instrument, "micro": is_micro, "variant": "micro" if is_micro else ("broker suffix/prefix" if remainder else "standard")})
+                matches.append({"symbol": name, "instrument": instrument, "asset_type": "metal" if instrument in GOLD else "forex", "micro": is_micro, "variant": "micro" if is_micro else ("broker suffix/prefix" if remainder else "standard")})
+                found = True
+                break
+        if found:
+            continue
+        # Also classify broker-listed non-major crosses such as EURPLN, using
+        # recognizable ISO currency codes while preserving the exact symbol.
+        for idx in range(max(0, len(normalized) - 5)):
+            pair = normalized[idx:idx + 6]
+            base, quote = pair[:3], pair[3:]
+            if base in FX_CURRENCIES and quote in FX_CURRENCIES and base != quote:
+                remainder = normalized[:idx] + normalized[idx + 6:]
+                is_micro = "MICRO" in remainder or normalized.endswith(pair + "M")
+                matches.append({"symbol": name, "instrument": pair, "asset_type": "forex", "micro": is_micro, "variant": "micro" if is_micro else ("broker suffix/prefix" if remainder else "standard")})
                 break
     return {"available": available, "matches": matches, "instruments": sorted(set(m["instrument"] for m in matches))}
 
@@ -91,7 +106,8 @@ class HistoryService:
         names = self.mt5.symbols()
         if symbol not in names:
             raise ValueError(f"El símbolo exacto {symbol} no existe en los símbolos del terminal")
-        end_dt = _aware(end, self.clock())
+        end_value=f"{end}T23:59:59.999999Z" if isinstance(end,str) and len(end)==10 else end
+        end_dt = _aware(end_value, self.clock())
         start_dt = _aware(start, datetime(1970, 1, 1, tzinfo=timezone.utc))
         if start_dt >= end_dt:
             raise ValueError("La fecha inicial debe ser anterior a la fecha final")
@@ -162,6 +178,55 @@ class HistoryService:
             limitations.append("El histórico recibido termina antes del final solicitado; los periodos recientes pueden no tener vela cerrada.")
         return HistoryResult(symbol, timeframe, len(downloaded), len(merged), merged.time.min().isoformat(), merged.time.max().isoformat(), str(active_csv), str(metadata_path), "válido: cronológico, OHLC consistente y sin timestamps duplicados", limitations)
 
+    def download_ticks(self, symbol: str, start, end, progress=None) -> dict:
+        """Save raw broker ticks separately; equal timestamps can be valid distinct events."""
+        if not SYMBOL_RE.fullmatch(symbol):
+            raise ValueError("Nombre de símbolo inválido")
+        if symbol not in self.mt5.symbols():
+            raise ValueError(f"El símbolo exacto {symbol} no existe en los símbolos del terminal")
+        start_dt, end_dt = _aware(start, datetime(1970, 1, 1, tzinfo=timezone.utc)), _aware(end, self.clock())
+        if start_dt >= end_dt:
+            raise ValueError("La fecha inicial debe ser anterior a la fecha final")
+        parts, cursor, pages = [], start_dt, 0
+        page = timedelta(days=1)
+        while cursor < end_dt:
+            upper = min(cursor + page, end_dt)
+            ticks = self.mt5.copy_ticks_range(symbol, cursor, upper)
+            error = self.mt5.last_error()
+            if ticks is None:
+                raise RuntimeError(f"MT5 falló descargando ticks de {symbol}: {error}")
+            batch = pd.DataFrame(ticks)
+            if not batch.empty:
+                if "time_msc" in batch:
+                    batch["timestamp"] = pd.to_datetime(batch.time_msc, unit="ms", utc=True, errors="coerce")
+                elif "time" in batch:
+                    batch["timestamp"] = pd.to_datetime(batch.time, unit="s", utc=True, errors="coerce")
+                else:
+                    raise ValueError("MT5 devolvió ticks sin time_msc ni time")
+                for col in ("bid", "ask", "last", "volume", "volume_real", "flags"):
+                    if col not in batch: batch[col] = 0
+                    batch[col] = pd.to_numeric(batch[col], errors="coerce").fillna(0)
+                batch = batch.dropna(subset=["timestamp"])
+                if (batch[["bid", "ask", "last", "volume", "volume_real"]] < 0).any().any():
+                    raise ValueError("MT5 devolvió ticks con precios o volúmenes negativos")
+                parts.append(batch[["timestamp", "bid", "ask", "last", "volume", "volume_real", "flags"]])
+            cursor = upper; pages += 1
+            if progress: progress({"pages_done": pages, "pages_total": max(1, (end_dt-start_dt+page-timedelta(seconds=1))//page), "ticks_received": sum(len(x) for x in parts)})
+        if not parts:
+            raise ValueError(f"MT5 no devolvió ticks para {symbol} en el rango solicitado; compruebe el historial de ticks del terminal")
+        frame = pd.concat(parts, ignore_index=True).drop_duplicates().sort_values("timestamp", kind="stable").reset_index(drop=True)
+        if not frame.timestamp.is_monotonic_increasing:
+            raise ValueError("Los ticks no se pudieron ordenar cronológicamente")
+        directory = self.data_dir / "mt5" / symbol
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "ticks.csv"
+        tmp = path.with_name(f".ticks.{uuid4().hex}.tmp")
+        frame.to_csv(tmp, index=False); tmp.replace(path)
+        metadata = {"symbol": symbol, "source": "MetaTrader5 terminal", "start": start_dt.isoformat(), "end": end_dt.isoformat(), "first_time": frame.timestamp.iloc[0].isoformat(), "last_time": frame.timestamp.iloc[-1].isoformat(), "count": len(frame), "downloaded_at": self.clock().isoformat(), "csv_path": str(path)}
+        meta = directory / "ticks.metadata.json"; meta_tmp = meta.with_suffix(".json.tmp")
+        meta_tmp.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"); meta_tmp.replace(meta)
+        return metadata
+
 
 def read_metadata(symbol: str, timeframe: str, data_dir: str | Path = "data") -> dict:
     if not SYMBOL_RE.fullmatch(symbol) or timeframe.upper() not in TIMEFRAMES:
@@ -184,3 +249,19 @@ def read_history(symbol: str, timeframe: str, data_dir: str | Path = "data") -> 
     if not path.exists():
         raise FileNotFoundError(f"No hay histórico guardado para {symbol} {timeframe}")
     return validate_candles(pd.read_csv(path))[CSV_COLUMNS]
+
+
+def read_ticks(symbol: str, data_dir: str | Path = "data") -> pd.DataFrame | None:
+    if not SYMBOL_RE.fullmatch(symbol):
+        raise ValueError("Nombre de símbolo inválido")
+    path=Path(data_dir)/"mt5"/symbol/"ticks.csv"
+    if not path.exists(): return None
+    frame=pd.read_csv(path)
+    required={"timestamp","bid","ask"}
+    if not required.issubset(frame.columns): raise ValueError(f"CSV de ticks inválido; faltan columnas: {', '.join(sorted(required-set(frame.columns)))}")
+    frame["timestamp"]=pd.to_datetime(frame.timestamp,utc=True,errors="coerce")
+    for col in ("bid","ask"):
+        frame[col]=pd.to_numeric(frame[col],errors="coerce")
+    frame=frame.dropna(subset=["timestamp","bid","ask"]).sort_values("timestamp",kind="stable").reset_index(drop=True)
+    if frame.empty or (frame[["bid","ask"]] < 0).any().any(): raise ValueError("CSV de ticks vacío o con cotizaciones inválidas")
+    return frame
