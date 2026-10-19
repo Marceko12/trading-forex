@@ -1,15 +1,18 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import io, json, uuid
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from .core.config import settings
-from .core.models import BacktestRequest, Signal, Decision
+from .core.models import BacktestRequest, Signal, Decision, HistoryDownloadRequest
 from .database.store import Store
 from .mt5.adapter import MT5Adapter
 from .strategies.baseline import decide
 from .strategies.indicators import add_indicators
 from .backtesting.engine import run_backtest
+from .market_data.history import HistoryService, TIMEFRAMES, discover_symbols, read_history, read_metadata, CSV_COLUMNS, SYMBOL_RE
+from .market_data.validation import validate_candles
 
 app = FastAPI(title=settings.app_name, version="0.1.0", description="Motor inicial seguro: análisis y backtest; no envía órdenes.")
 app.add_middleware(CORSMiddleware, allow_origins=["http://localhost:5173"], allow_methods=["*"], allow_headers=["*"])
@@ -17,6 +20,7 @@ store=Store(settings.database_path)
 mt5=MT5Adapter()
 runtime={"running":False,"paused":False,"mode":settings.mode}
 mt5_state={"connected":False,"error":"No se ha solicitado conexión a MT5"}
+history_jobs={}
 
 @app.get("/api/status")
 def status():
@@ -73,11 +77,75 @@ def events(): return {"events":store.events()}
 @app.get("/api/backtests")
 def backtests(): return {"backtests":store.backtests()}
 
+@app.get("/api/history/symbols")
+def history_symbols():
+    if not mt5_state.get("connected") or mt5._mt5 is None:
+        raise HTTPException(503,"MT5 está desconectado. Abra el terminal autenticado y pulse Conectar MT5.")
+    return discover_symbols(mt5.symbols())
+
+@app.post("/api/history/download")
+def download_history(request: HistoryDownloadRequest, background: BackgroundTasks):
+    if not mt5_state.get("connected") or mt5._mt5 is None:
+        raise HTTPException(503,"MT5 está desconectado. Conecte el terminal antes de descargar histórico.")
+    if not SYMBOL_RE.fullmatch(request.symbol): raise HTTPException(400,"Símbolo inválido")
+    job_id=str(uuid.uuid4())
+    history_jobs[job_id]={"id":job_id,"status":"queued","progress":{"pages_done":0,"candles_received":0}}
+    def run():
+        job=history_jobs[job_id];job["status"]="running"
+        def progress(values): job["progress"].update(values)
+        try:
+            service=HistoryService(mt5)
+            result=service.download(request.symbol,request.timeframe,request.start,request.end,progress)
+            job["result"]=result.__dict__;job["status"]="completed"
+            store.log("history_download",job["result"])
+        except Exception as exc:
+            job["status"]="failed";job["error"]=str(exc)
+            store.log("history_download_error",{"symbol":request.symbol,"timeframe":request.timeframe,"error":str(exc)})
+    background.add_task(run)
+    return {"job_id":job_id,"status":"queued"}
+
+@app.get("/api/history/jobs/{job_id}")
+def history_job(job_id: str):
+    if job_id not in history_jobs: raise HTTPException(404,"Trabajo de descarga no encontrado")
+    return history_jobs[job_id]
+
+@app.get("/api/history/{symbol}/{timeframe}")
+def history_info(symbol: str, timeframe: str):
+    try:
+        frame=read_history(symbol,timeframe)
+        return {"symbol":symbol,"timeframe":timeframe.upper(),"count":len(frame),"first_time":frame.time.min().isoformat(),"last_time":frame.time.max().isoformat(),"validation":"válido","metadata":read_metadata(symbol,timeframe)}
+    except (ValueError,FileNotFoundError) as exc: raise HTTPException(404,str(exc))
+
+@app.post("/api/history/import/{symbol}/{timeframe}")
+async def import_history(symbol: str,timeframe: str,request: Request):
+    """Import an existing CSV as raw text body; no multipart dependency required."""
+    if not SYMBOL_RE.fullmatch(symbol): raise HTTPException(400,"Símbolo inválido")
+    timeframe=timeframe.upper()
+    if timeframe not in TIMEFRAMES: raise HTTPException(400,"Temporalidad no admitida")
+    try:
+        body=await request.body()
+        frame=validate_candles(pd.read_csv(io.BytesIO(body)))[CSV_COLUMNS]
+    except Exception as exc: raise HTTPException(400,f"CSV rechazado: {exc}")
+    root=Path("data");archive=root/"mt5"/symbol/f"{timeframe.upper()}.csv";active=root/f"{symbol}.csv"
+    archive.parent.mkdir(parents=True,exist_ok=True);root.mkdir(exist_ok=True)
+    nonce=uuid.uuid4().hex
+    archive_tmp=archive.with_name(f".{archive.name}.{nonce}.tmp");active_tmp=active.with_name(f".{active.name}.{nonce}.tmp")
+    frame.to_csv(archive_tmp,index=False);frame.to_csv(active_tmp,index=False);archive_tmp.replace(archive);active_tmp.replace(active)
+    metadata={"symbol":symbol,"timeframe":timeframe.upper(),"first_time":frame.time.min().isoformat(),"last_time":frame.time.max().isoformat(),"count":len(frame),"downloaded_at":datetime.now(timezone.utc).isoformat(),"source":"CSV importado por usuario","contract_spec":{}}
+    (archive.parent/f"{timeframe.upper()}.metadata.json").write_text(json.dumps(metadata,ensure_ascii=False,indent=2),encoding="utf-8")
+    store.log("history_csv_import",metadata)
+    return metadata
+
 @app.post("/api/backtests")
 def backtest(request: BacktestRequest):
-    frame=load_csv(request.symbol)
-    try: result=run_backtest(frame,request.initial_balance,request.risk_per_trade,request.spread,request.commission,request.slippage,request.train_fraction)
+    try:
+        frame=read_history(request.symbol,request.timeframe)
+        if request.start: frame=frame[frame.time >= pd.to_datetime(request.start,utc=True)]
+        if request.end: frame=frame[frame.time <= pd.to_datetime(request.end,utc=True)]
+        metadata=read_metadata(request.symbol,request.timeframe)
+        result=run_backtest(frame,request.initial_balance,request.risk_per_trade,request.spread,request.commission,request.slippage,request.train_fraction,metadata.get("contract_spec"))
     except ValueError as exc: raise HTTPException(400,str(exc))
+    except FileNotFoundError as exc: raise HTTPException(404,str(exc))
     result["symbol"]=request.symbol; result["timeframe"]=request.timeframe
     ident=store.save_backtest(request.symbol,result); result["id"]=ident
     return result

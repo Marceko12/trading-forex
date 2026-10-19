@@ -4,6 +4,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp/
 .venv/
 venv/
 node_modules/
@@ -16,6 +17,7 @@ dist/
 *.tmp
 data/*.csv
 data/*.json
+data/mt5/
 reports/*
 !reports/.gitkeep
 !data/.gitkeep

@@ -12,14 +12,14 @@ Base inicial segura para análisis de mercado y backtesting. El modo predetermin
 Desde la raíz del repositorio:
 
 ```powershell
-.scriptsinstall.ps1
-.scriptsstart-backend.ps1
+& .\scripts\install.ps1
+& .\scripts\start-backend.ps1
 ```
 
 En otra consola:
 
 ```powershell
-.scriptsstart-frontend.ps1
+& .\scripts\start-frontend.ps1
 ```
 
 Abre `http://127.0.0.1:5173`. API: `http://127.0.0.1:8000`; documentación interactiva: `http://127.0.0.1:8000/docs`.
@@ -56,6 +56,16 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/backtests -Content
 ```
 
 El backtest ejecuta las decisiones calculadas con la vela anterior en la apertura siguiente; para una misma vela que toque SL y TP, cuenta SL primero. Spread, slippage y comisión son parámetros en unidades genéricas de precio/coste; ajuste las unidades al dataset y contrato antes de interpretar. Riesgo/tamaño se calcula en unidades de precio OHLC, no convierte automáticamente tick value o moneda de cuenta como haría MT5. El Sharpe mostrado usa cambios de equity por barra anualizados con `sqrt(252)`, una hipótesis de periodicidad que no representa necesariamente retornos diarios. La prueba fuera de muestra es la cola temporal posterior al segmento de entrenamiento; no se hace optimización de parámetros.
+
+## Datos históricos desde MT5 y comparación
+
+En Windows abra el terminal MetaTrader 5, inicie sesión y pulse **Conectar MT5**. En **Datos históricos**, seleccione el símbolo exacto descubierto en el bróker (las variantes `micro` se mantienen como instrumentos distintos), la temporalidad M1/M5/M15/H1/H4 y opcionalmente el rango de fechas. Si deja ambas fechas vacías, se solicita desde 1970 hasta ahora, paginando según la temporalidad; la cantidad final depende del historial que entregue el bróker y del límite de barras del terminal. La interfaz informa fechas reales cubiertas, velas y limitaciones.
+
+Los datos se guardan como `data/<SIMBOLO>.csv` para compatibilidad con el panel actual y, para conservar varias temporalidades, como `data/mt5/<SIMBOLO>/<TF>.csv`, junto a metadatos JSON del contrato y de la descarga. Las descargas siguientes hacen merge por timestamp. El backtest usa el archivo de la temporalidad seleccionada. Si desconecta MT5, puede elegir/escribir el símbolo y usar **Importar CSV existente**; las columnas de OHLC y `time` son obligatorias, y las columnas de volumen se normalizan a cero cuando faltan.
+
+El backtest aprovecha `trade_tick_size`, `trade_tick_value` y los límites/pasos de volumen de MT5 cuando la descarga los proporciona. El tamaño se redondea hacia abajo al paso permitido; si el volumen calculado cae bajo el mínimo, no abre esa operación simulada. En CSV importados sin metadatos de contrato se conserva el cálculo genérico por unidades de precio. La comisión de la interfaz se interpreta por lote y por lado cuando hay especificación de contrato.
+
+La API también expone `GET /api/history/symbols`, `POST /api/history/download`, `GET /api/history/jobs/<job_id>`, `GET /api/history/<simbolo>/<tf>` y `POST /api/history/import/<simbolo>/<tf>` (CSV en el cuerpo raw de la petición).
 
 ## Pruebas
 

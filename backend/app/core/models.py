@@ -1,6 +1,12 @@
 from enum import Enum
 from pydantic import BaseModel, Field
 
+class HistoryDownloadRequest(BaseModel):
+    symbol: str
+    timeframe: str
+    start: str | None = None
+    end: str | None = None
+
 class Decision(str, Enum):
     BUY = "BUY"
     SELL = "SELL"
@@ -26,4 +32,6 @@ class BacktestRequest(BaseModel):
     commission: float = Field(default=0, ge=0)
     slippage: float = Field(default=0, ge=0)
     train_fraction: float = Field(default=0.7, gt=0.5, lt=0.9)
+    start: str | None = None
+    end: str | None = None
 
