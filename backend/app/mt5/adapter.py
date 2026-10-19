@@ -1,12 +1,17 @@
 """Lazy MT5 adapter. Real trading is deliberately not exposed by this starter."""
 class MT5Adapter:
-    def __init__(self): self._mt5 = None
+    def __init__(self, connect_timeout_ms=10000):
+        self._mt5 = None
+        self.connect_timeout_ms = connect_timeout_ms
     def connect(self):
         try:
             import MetaTrader5 as mt5
             self._mt5 = mt5
-            if not mt5.initialize():
-                return {"connected": False, "error": str(mt5.last_error())}
+            if not mt5.initialize(timeout=self.connect_timeout_ms):
+                error = str(mt5.last_error())
+                mt5.shutdown()
+                self._mt5 = None
+                return {"connected": False, "error": error}
             account = mt5.account_info()
             terminal = mt5.terminal_info()
             return {"connected": True, "account": account.login if account else None,
@@ -15,6 +20,12 @@ class MT5Adapter:
                     "equity": account.equity if account else None,
                     "terminal": terminal.name if terminal else None}
         except Exception as exc:
+            if self._mt5:
+                try:
+                    self._mt5.shutdown()
+                except Exception:
+                    pass
+            self._mt5 = None
             return {"connected": False, "error": str(exc)}
     def disconnect(self):
         if self._mt5:
