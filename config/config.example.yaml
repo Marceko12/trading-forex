@@ -1,0 +1,10 @@
+mode: BACKTEST
+symbols: [XAUUSD, EURUSD, GBPUSD, USDJPY]
+risk:
+  per_trade: 0.005
+  daily_loss_limit: 0.02
+  max_drawdown: 0.05
+execution:
+  enabled: false
+  one_position_per_symbol: true
+  allow_real: false
